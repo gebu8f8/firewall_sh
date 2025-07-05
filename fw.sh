@@ -128,9 +128,9 @@ allow_cf_ip(){
             # 檢查規則是否存在再刪
             if ! ufw status | grep -q "ALLOW.*$ip_range"; then
                 ufw allow from "$ip_range"
-                echo "✅ 有此規則：$ip_range，跳過"
+                echo "✅ 已添加規則：$ip_range"
             else
-                echo "ℹ️ 無此規則：$ip_range"
+                echo "ℹ️ 有此規則：$ip_range，跳過""
             fi
         fi
     done < "$temp_file"
