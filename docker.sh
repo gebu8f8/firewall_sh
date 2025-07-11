@@ -1,4 +1,6 @@
 #!/bin/bash
+
+
 check_system(){
   if command -v apt >/dev/null 2>&1; then
     system=1
@@ -6,60 +8,75 @@ check_system(){
     system=2
   elif command -v apk >/dev/null 2>&1; then
     system=3
-   else
-    echo "不支援的系統。" >&2
-    exit 1
   fi
 }
-check_system
+
 save_rules() {
-  if [ "$system" -eq 1 ]; then
-    echo "儲存防火牆規則中..."
-
-    mkdir -p /etc/iptables
-
-    iptables-save > /etc/iptables/rules.v4
-    ip6tables-save > /etc/iptables/rules.v6
-    iptables-restore < /etc/iptables/rules.v4
-    ip6tables-restore < /etc/iptables/rules.v6
-  elif [ "$system" -eq 2 ]; then
-    # 儲存規則
-    service iptables save
-    service ip6tables save
-  elif [ "$system" -eq 3 ]; then
-    /etc/init.d/iptables save
-    /etc/init.d/ip6tables save
-  else
-    echo "此系統目前尚未支援自動儲存規則。"
-  fi
+  case "$system" in
+    1)
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4
+      ip6tables-save > /etc/iptables/rules.v6
+      ;;
+    2)
+      service iptables save
+      service ip6tables save
+      ;;
+    3)
+      /etc/init.d/iptables save
+      /etc/init.d/ip6tables save
+      ;;
+  esac
 }
 
-EXT_IF=$(ip route | grep default | grep -o 'dev [^ ]*' | cut -d' ' -f2)
-[ -z "$EXT_IF" ] && EXT_IF="eth0"  # fallback 預設
+# 偵測系統類型
+check_system
+
 
 while true; do
-  networks=$(docker network ls -q | xargs -n1 docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+  # 標記本次迴圈是否有規則變更
+  rules_changed=0
 
-  for cidr in $networks; do
-    # NAT
+  # 1. 獲取 "事實標準"：當前所有活躍的 Docker 網路子網
+  # 使用 grep '.' 過濾掉沒有子網的網路（例如 host 模式），並用 sort -u 確保唯一性
+  current_subnets=$(docker network ls -q | xargs -r -n1 docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | grep '.' | sort -u)
+
+  # 2. 獲取 "當前配置"：從 iptables 中找出所有已配置的 Docker 子網
+  # 我們可以通過 nat 表中的 MASQUERADE 規則來識別它們
+  configured_subnets=$(iptables-save -t nat | grep 'MASQUERADE' | grep -o ' -s \S*/\S*' | awk '{print $2}' | sort -u)
+
+  # 3. 遍歷當前活躍的網路，如果規則不存在就添加
+  for cidr in $current_subnets; do
+    # 檢查 NAT 規則是否存在
     if ! iptables -t nat -C POSTROUTING -s "$cidr" -j MASQUERADE &>/dev/null; then
+      # 添加 NAT 規則
       iptables -t nat -A POSTROUTING -s "$cidr" -j MASQUERADE
-      echo "$(date) [NAT] 加入 $cidr" >> /var/log/docker_fw.log
-    fi
-
-    # FORWARD 出
-    if ! iptables -C FORWARD -s "$cidr" -j ACCEPT &>/dev/null; then
+      # 添加 FORWARD 規則
       iptables -A FORWARD -s "$cidr" -j ACCEPT
-      echo "$(date) [FORWARD] 出口 $cidr" >> /var/log/docker_fw.log
-    fi
-
-    # FORWARD 回
-    if ! iptables -C FORWARD -d "$cidr" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
       iptables -A FORWARD -d "$cidr" -m state --state RELATED,ESTABLISHED -j ACCEPT
-      echo "$(date) [FORWARD] 回應 $cidr" >> /var/log/docker_fw.log
+      rules_changed=1
     fi
-    save_rules
   done
 
-  sleep 15  # 每 15 秒掃描一次
+  # 4. 遍歷已配置的規則，如果對應的網路已不存在就刪除
+  for cidr in $configured_subnets; do
+    # 檢查這個已配置的 CIDR 是否還在活躍的網路列表中
+    # 使用 grep -w 精確匹配整個單詞
+    if ! echo "$current_subnets" | grep -q -w "$cidr"; then
+      # 刪除 NAT 規則
+      iptables -t nat -D POSTROUTING -s "$cidr" -j MASQUERADE &>/dev/null
+      # 刪除 FORWARD 規則
+      iptables -D FORWARD -s "$cidr" -j ACCEPT &>/dev/null
+      iptables -D FORWARD -d "$cidr" -m state --state RELATED,ESTABLISHED -j ACCEPT &>/dev/null
+      rules_changed=1
+    fi
+  done
+
+  # 如果本次迴圈中有任何規則被添加或刪除，才執行儲存操作
+  if [ "$rules_changed" -eq 1 ]; then
+    save_rules
+  fi
+
+  # 休眠 15 秒
+  sleep 15
 done
