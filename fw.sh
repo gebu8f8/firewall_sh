@@ -1,5 +1,15 @@
 #!/bin/bash
 
+if [ "$(id -u)" -ne 0 ]; then
+  echo "此腳本需要root權限運行" 
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo "$0" "$@"
+  else
+    echo "無sudo指令"
+    exit 1
+  fi
+fi
+
 
 # 定義顏色
 GREEN="\033[1;32m"
