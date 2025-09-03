@@ -1,15 +1,5 @@
 #!/bin/bash
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "此腳本需要root權限運行" 
-  if command -v sudo >/dev/null 2>&1; then
-    exec sudo "$0" "$@"
-  else
-    echo "無sudo指令"
-    exit 1
-  fi
-fi
-
 
 # 定義顏色
 GREEN="\033[1;32m"
@@ -19,6 +9,18 @@ CYAN="\033[1;36m"
 RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
+
+version="4.0.4"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "此腳本需要root權限運行" 
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo "$0" "$@"
+  else
+    echo "無sudo指令"
+    exit 1
+  fi
+fi
 
 
 allow_port() {
@@ -657,55 +659,72 @@ EOF
   check_docker
 }
 disable_in_docker(){
-  daemon="/etc/docker/daemon.json"
+  local daemon="/etc/docker/daemon.json"
+  local EXTERNAL_INTERFACE=""
   if ! command -v docker &>/dev/null; then
     echo "未安裝docker，請先安裝"
-    read -p "請按任意鍵繼續" -n1
+    sleep 1
     return 1
-  else
-    
-    # 偵測外網網卡 (非本地回環接口)
-    EXTERNAL_INTERFACE=$(ip route | grep default | grep -o 'dev [^ ]*' | cut -d' ' -f2)
-
-    # 確認是否找到了外網網卡
+  fi
+  # 偵測外網網卡 (優先 IPv4，失敗則嘗試 IPv6)
+  EXTERNAL_INTERFACE=$(ip route | grep default | grep -o 'dev [^ ]*' | cut -d' ' -f2)
+  if [ -z "$EXTERNAL_INTERFACE" ]; then
+    EXTERNAL_INTERFACE=$(ip -6 route | grep default | grep -o 'dev [^ ]*' | cut -d' ' -f2)
     if [ -z "$EXTERNAL_INTERFACE" ]; then
       echo "未找到外網網卡！"
+      sleep 1
       return 1
     fi
-    # 檢查網卡是否存在
-    if ip link show "$EXTERNAL_INTERFACE" > /dev/null 2>&1; then
-      echo "偵測到外網網卡: $EXTERNAL_INTERFACE"
-      # 在 DOCKER-USER 鏈上加入 DROP 規則
-      iptables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
-      echo "關閉外網進入docker內部流量。"
-      mkdir -p /etc/docker
-      touch $daemon
-      [ ! -s "$daemon" ] && echo '{}' > "$daemon"
-      if [ ! -f "$daemon" ] || ! jq empty "$daemon" &>/dev/null; then
-          echo '{}' > "$daemon"
-          echo "已初始化 $daemon 為空的 JSON 結構。"
-      fi
-      if jq -e '.iptables == false' "$daemon" &>/dev/null; then
-        echo "已存在 \"iptables\": false，跳過修改。"
-        open_docker_fw_service
-      else
-          cp "$daemon" "$daemon.bak"
-          tmp=$(mktemp)
-          jq '. + {"iptables": false}' "$daemon" > "$tmp" && mv "$tmp" "$daemon"
-          echo "已透過 jq 安全插入。"
-          if (( system == 1 || system == 2 )); then
-            systemctl restart docker
-          elif [ "$system" -eq 3 ]; then
-            rc-service docker restart
-          fi
-          open_docker_fw_service
+  fi
+
+  # 檢查網卡是否存在
+  if ip link show "$EXTERNAL_INTERFACE" > /dev/null 2>&1; then
+    echo "偵測到外網網卡: $EXTERNAL_INTERFACE"
+  else
+    echo "找不到網卡 $EXTERNAL_INTERFACE，請檢查網路配置。"
+    sleep 1
+    return 1
+  fi
+  
+  iptables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
+  echo "關閉外網(IPv4)進入docker內部流量。"
+  if [ -f "$daemon" ] && grep -q '"ipv6": true' "$daemon"; then
+    local ipv6=true
+  e
+  fi
+  if [[ "$ipv6" == "true" ]]; then
+    echo "偵測到 Docker 已啟用 IPv6，正在設定對應防火牆..."
+      # 檢查 ip6tables 是否存在
+    ip6tables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
+    echo "已關閉外網(IPv6)進入docker內部流量。"
+  fi
+
+  # 確保 docker 設定檔目錄與檔案存在
+  mkdir -p /etc/docker
+  touch $daemon
+  [ ! -s "$daemon" ] && echo '{}' > "$daemon"
+      
+  # 檢查並確保 daemon.json 是有效的 JSON
+  if ! jq empty "$daemon" &>/dev/null; then
+    echo '{}' > "$daemon"
+    echo "已初始化 $daemon 為空的 JSON 結構。"
+  fi
+      
+  # 檢查並設定 "iptables": false
+  if jq -e '.iptables == false' "$daemon" &>/dev/null; then
+    echo "已存在 \"iptables\": false，跳過修改。"
+    open_docker_fw_service $ipv6
+  else
+    cp "$daemon" "$daemon.bak"
+    local tmp=$(mktemp)
+    jq '. + {"iptables": false}' "$daemon" > "$tmp" && mv "$tmp" "$daemon"
+    echo "已透過 jq 安全插入 \"iptables\": false。"
           
-          save_rules
-      fi
-    else
-      echo "找不到網卡 $EXTERNAL_INTERFACE，請檢查網路配置。"
-      exit 1
-    fi
+    # 重啟 Docker 服務
+    service docker restart
+          
+    open_docker_fw_service $ipv6
+    save_rules
   fi
 }
 
@@ -836,9 +855,27 @@ deny_port() {
 }
 
 open_docker_fw_service() {
+    local ipv6="${1:-false}"
+    # 預先定義好服務要執行的最終指令
+    local service_command="/etc/fw/docker.sh"
+
     mkdir -p /etc/fw/
+    
+    # 修正：下載 v4 腳本到正確的檔名
     wget -O /etc/fw/docker.sh https://gitlab.com/gebu8f/sh/-/raw/main/firewall/docker.sh
     chmod +x /etc/fw/docker.sh
+
+    if [ "$ipv6" == "true" ]; then
+      echo "IPv6 模式啟用，下載對應腳本並準備複合指令..."
+      # 下載 v6 腳本
+      wget -O /etc/fw/docker-v6.sh https://gitlab.com/gebu8f/sh/-/raw/main/firewall/docker-v6.sh
+      chmod +x /etc/fw/docker-v6.sh
+      
+      # 【核心修改】使用 sh -c 來安全地執行兩個腳本
+      # 這確保了無論是 systemd 還是 openrc 都能正確處理
+      service_command="/bin/bash -c '/etc/fw/docker.sh && /etc/fw/docker-v6.sh'"
+    fi
+
     case $system in
     1|2)
       cat > /etc/systemd/system/docker-firewall.service << EOF
@@ -847,7 +884,7 @@ Description=Docker Firewall Auto-Guard Service
 After=network.target docker.service
 
 [Service]
-ExecStart=/etc/fw/docker.sh
+ExecStart=${service_command}
 Restart=always
 RestartSec=5
 StandardOutput=null
@@ -857,18 +894,19 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
       systemctl daemon-reload
-      systemctl enable docker-firewall
-      systemctl start docker-firewall
+      systemctl enable --now docker-firewall
       ;;
     3)
-      sed -i '/check_system/a echo $$ > /run/docker-firewall.pid' /etc/fw/docker.sh
+      # 【優化】移除 sed 手動注入 PID 的操作，完全交給 OpenRC 管理，這樣更穩定可靠。
+      # sed -i '/check_system/a echo $$ > /run/docker-firewall.pid' /etc/fw/docker.sh
       cat > /etc/init.d/docker-firewall << EOF
 #!/sbin/openrc-run
 
 name="docker-firewall"
-command="/etc/fw/docker.sh"
+# 使用我們動態構建的指令
+command="${service_command}"
 command_background="yes"
-pidfile="/run/docker-firewall.pid"
+pidfile="/run/${name}.pid"
 
 depend() {
     need net docker
@@ -879,7 +917,7 @@ EOF
       rc-service docker-firewall start
       ;;
     esac
-
+    echo "Docker 防火牆服務已設定並啟動。"
 }
 
 # 設置速率限制以防禦DDoS攻擊
@@ -1063,7 +1101,7 @@ save_rules() {
 }
 
 update_script() {
-  local download_url="https://raw.githubusercontent.com/gebu8f8/firewall_sh/refs/heads/main/fw.sh"
+  local download_url="https://gitlab.com/gebu8f/sh/-/raw/main/firewall/fw.sh"
   local temp_path="/tmp/fw.sh"
   local current_script="/usr/local/bin/fw"
   local current_path="$0"
@@ -1763,7 +1801,7 @@ menu_install_fw(){
 }
 case "$1" in
   --version|-V)
-    echo "Linux防火牆管理器版本 4.0.2"
+    echo "Linux防火牆管理器版本$version"
     exit 0
     ;;
 esac
