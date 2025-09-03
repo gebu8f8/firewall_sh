@@ -1,0 +1,165 @@
+name: Generate Release Note
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release_note:
+    runs-on: ubuntu-latest
+
+    env:
+      AI_API_URL: ${{ secrets.AI_API_URL }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if fw.sh was modified in this push
+        id: check_ngsh_commit
+        run: |
+             if git rev-parse HEAD~1 >/dev/null 2>&1; then
+              # 檢查 HEAD~1 → HEAD 是否變更 fw.sh
+              if git diff --name-only HEAD~1 HEAD | grep -q '^fw\.sh$'; then
+               echo "changed_ngsh=true" >> $GITHUB_ENV
+               echo "本次 push 有修改 fw.sh"
+              else
+                echo "changed_ngsh=false" >> $GITHUB_ENV
+                echo "本次 push 未修改 fw.sh，後續流程將跳過"
+              fi
+             else
+                # 若 repo 僅有一個 commit
+               if git ls-tree --name-only HEAD | grep -q '^fw\.sh$'; then
+                 echo "changed_ngsh=true" >> $GITHUB_ENV
+                 echo "首次 commit 包含 fw.sh"
+               else
+                echo "changed_ngsh=false" >> $GITHUB_ENV
+                echo "首次 commit 未包含 fw.sh，後續流程將跳過"
+               fi
+             fi
+
+      - name: Read version from fw.sh
+        if: env.changed_ngsh == 'true'
+        id: read_version
+        run: |
+          raw_version=$(grep '^version=' fw.sh | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+          echo "抓到原始版本: $raw_version"
+
+          if [[ "$raw_version" =~ ^v ]]; then
+            version_final="$raw_version"
+          else
+            version_final="v$raw_version"
+          fi
+
+          echo "version_final=$version_final" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        if: env.changed_ngsh == 'true'
+        id: check_tag
+        run: |
+          git fetch --tags
+          if git tag --list | grep -q "^${{ steps.read_version.outputs.version_final }}$"; then
+            echo "此版本已存在，不重複執行。"
+            echo "skip_whole_workflow=true" >> $GITHUB_ENV
+          else
+            echo "skip_whole_workflow=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate git diff
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true'
+        id: diff
+        run: |
+          git fetch origin main
+
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            if git diff --quiet HEAD~1 HEAD -- fw.sh; then
+              echo "diff_text=(未變更 fw.sh)" >> $GITHUB_ENV
+              echo "skip_ai=true" >> $GITHUB_ENV
+            else
+              diff_text=$(git diff HEAD~1 HEAD -- fw.sh | grep -vE '^[+-]version=')
+              echo "diff_text<<EOF" >> $GITHUB_ENV
+              echo "$diff_text" >> $GITHUB_ENV
+              echo "EOF" >> $GITHUB_ENV
+              echo "skip_ai=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "首次 commit，無法產生 diff"
+            echo "diff_text=(首次 commit)" >> $GITHUB_ENV
+            echo "skip_ai=true" >> $GITHUB_ENV
+          fi
+
+      - name: Call custom AI API
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        run: |
+          diff_json=$(jq -Rs . <<< "$diff_text")
+
+          json_payload=$(jq -n \
+            --arg system_msg "請用繁體中文，根據以下 diff 寫出 changelog 條列，不要開場白、不要說明文字、也不要提到版本更新，也不要提到 diff，僅條列變更項目，簡短扼要。條列時請使用 - 作為項目前綴符號。" \
+            --arg user_msg "$diff_text" \
+            '{
+              model:"deepseek/DeepSeek-V3-0324",
+              messages: [
+                {"role": "system", "content": $system_msg},
+                {"role": "user", "content": $user_msg}
+              ]
+            }')
+
+          curl -s -X POST $AI_API_URL \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$json_payload" > response.json
+
+          summary=$(jq -r '.choices[0].message.content // "AI 回傳空結果"' response.json)
+
+          echo "summary<<EOF" >> $GITHUB_ENV
+          echo "$summary" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show Release Note
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true'
+        env:
+          SUMMARY_CONTENT: ${{ env.summary }}
+        run: |
+          echo "最終版本號: ${{ steps.read_version.outputs.version_final }}"
+          echo "$SUMMARY_CONTENT"
+
+      - name: Create git tag
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        run: |  
+          git tag ${{ steps.read_version.outputs.version_final }}
+          git push origin ${{ steps.read_version.outputs.version_final }}
+  
+      - name: Create GitHub Release
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.read_version.outputs.version_final }}
+          name: ${{ steps.read_version.outputs.version_final }}
+          body: ${{ env.summary }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Telegram Message
+        continue-on-error: true
+        if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true' && env.skip_ai == 'false'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FINAL_VERSION: ${{ steps.read_version.outputs.version_final }}
+          SUMMARY_CONTENT: ${{ env.summary }}
+        run: |
+          # 組合訊息，在最前面加上固定的標題和一個換行
+          MESSAGE_BODY="【防火牆管理器】
+          $FINAL_VERSION
+
+          $SUMMARY_CONTENT"
+          
+          # 使用 curl 的 --data-urlencode 來安全地傳遞文字
+          curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TG_CHAT_ID" \
+            --data-urlencode "text=$MESSAGE_BODY" \
+            --data-urlencode "parse_mode=Markdown"
