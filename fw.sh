@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="4.0.4"
+version="4.0.5"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "此腳本需要root權限運行" 
@@ -316,15 +316,15 @@ censys_block() {
     iptables -N CENSYS_BLOCK 2>/dev/null
     ip6tables -N CENSYS_BLOCK 2>/dev/null
 
-    iptables -C INPUT -j CENSYS_BLOCK 2>/dev/null || iptables -A INPUT -j CENSYS_BLOCK
-    ip6tables -C INPUT -j CENSYS_BLOCK 2>/dev/null || ip6tables -A INPUT -j CENSYS_BLOCK
+    iptables -C INPUT -j CENSYS_BLOCK 2>/dev/null || iptables -I INPUT -j CENSYS_BLOCK
+    ip6tables -C INPUT -j CENSYS_BLOCK 2>/dev/null || ip6tables -I INPUT -j CENSYS_BLOCK
 
     for ip in "${ipv4_list[@]}"; do
-      iptables -A CENSYS_BLOCK -s "$ip" -j DROP
+      iptables -I CENSYS_BLOCK -s "$ip" -j DROP
     done
 
     for ip in "${ipv6_list[@]}"; do
-      ip6tables -A CENSYS_BLOCK -s "$ip" -j DROP
+      ip6tables -I CENSYS_BLOCK -s "$ip" -j DROP
     done
     echo "[+] 規則已添加。"
 
