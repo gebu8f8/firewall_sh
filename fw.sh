@@ -1784,7 +1784,7 @@ case "$1" in
       fi
     elif [[ $2 == ip_port ]]; then
       [[ -z "$3" || -z "$4" ]] && fw help
-      proto_cli=${4:-tcp}
+      proto_cli=${5:-tcp}
       [[ $proto_cli != "tcp" && $proto_cli != "udp" ]] && echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}" >&2 && exit 1
       [ $fw == ufw ] && ufw $act1_ufw $act_ufw from "$3" to any port "$4" proto "$proto_cli"
       if [ $fw == iptables ]; then
