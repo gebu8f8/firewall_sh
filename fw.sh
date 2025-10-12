@@ -10,15 +10,31 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="4.0.5"
+version="5.0.0"
 
+# 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
-  echo "此腳本需要root權限運行" 
+  echo -e "${YELLOW}此腳本需要root權限運行${RESET}" 
   if command -v sudo >/dev/null 2>&1; then
     exec sudo "$0" "$@"
   else
-    echo "無sudo指令"
-    exit 1
+    install_sudo_cmd=""
+    if command -v apt >/dev/null 2>&1; then
+      install_sudo_cmd="apt-get update && apt-get install -y sudo"
+    elif command -v yum >/dev/null 2>&1; then
+      install_sudo_cmd="yum install -y sudo"
+    elif command -v apk >/dev/null 2>&1; then
+      install_sudo_cmd="apk add sudo"
+    else
+      echo -e "${RED}無sudo指令${RESET}"
+      sleep 1
+      exit 1
+    fi
+    su -c "$install_sudo_cmd"
+    if [ $? -eq 0 ] && command -v sudo >/dev/null 2>&1; then
+      echo -e "${GREEN}sudo指令已經安裝成功，請等下輸入您的密碼${RESET}"
+      exec sudo "$0" "$@"
+    fi
   fi
 fi
 
@@ -26,7 +42,8 @@ fi
 allow_port() {
   local PROTO="$1"  # 第一個參數是協議類型
   if [ -z "$2" ]; then
-    echo "錯誤：未指定端口號"
+    echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
+    sleep 1
     return 1
   fi
   
@@ -40,7 +57,6 @@ allow_port() {
       if [ -z "$PORT" ]; then
         continue  # 跳過空端口
       fi
-      echo "檢查並開啟$PROTO端口 $PORT..."
       ufw allow $PORT/$PROTO
     done
     return 0
@@ -50,79 +66,66 @@ allow_port() {
       continue  # 跳過空端口
     fi
     # ipv4
-    echo "檢查並開啟$PROTO端口 $PORT..."
-    if iptables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo "IPv4 $PROTO 端口 $PORT 已存在，跳過開啟"
-    else
+    if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
       if iptables -A INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-        echo "IPv4 $PROTO 端口 $PORT 已開啟"
+        echo -e "${GREEN}IPv4 $PROTO 端口 $PORT 已開啟${RESET}" >&2
       else
-        echo "錯誤：無法開啟 IPv4 $PROTO 端口 $PORT"
+        echo -e "${RED}錯誤：無法開啟 IPv4 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
     # ipv6
-    if ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo "IPv6 $PROTO 端口 $PORT 已存在，跳過開啟"
-    else
+    if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
       if ip6tables -A INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-        echo "IPv6 $PROTO 端口 $PORT 已開啟"
+        echo -e "${GREEN}IPv6 $PROTO 端口 $PORT 已開啟${RESET}" >&2
       else
-        echo "錯誤：無法開啟 IPv6 $PROTO 端口 $PORT"
+        echo -e "${RED}錯誤：無法開啟 IPv6 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
   done
   return 0
 }
 allow_ping() {
-  echo "允許ping..."
-
   if [ $fw = ufw ]; then
     sed -i 's/--icmp-type echo-request -j DROP/--icmp-type echo-request -j ACCEPT/' /etc/ufw/before.rules
     sed -i 's/--icmpv6-type echo-request -j DROP/--icmpv6-type echo-request -j ACCEPT/' /etc/ufw/before6.rules
     ufw reload
-    echo "✅ ICMP 已開啟"
+    echo -e "${GREEN}ICMP 已開啟${RESET}" >&2
     return
   fi
 
   # IPv4
   iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null
   iptables -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
-  echo "IPv4 ping已允許"
-
   # IPv6
   ip6tables -D INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP 2>/dev/null
   ip6tables -I INPUT -p ipv6-icmp --icmpv6-type 128 -j ACCEPT
-  echo "IPv6 ping已允許"
+  echo -e "${GREEN}ICMP 已開啟${RESET}" >&2
 
   save_rules
 }
 
 block_ping() {
-  echo "禁止ping..."
-
   if [ $fw = ufw ]; then
     sed -i 's/--icmp-type echo-request -j ACCEPT/--icmp-type echo-request -j DROP/' /etc/ufw/before.rules
     sed -i 's/--icmpv6-type echo-request -j ACCEPT/--icmpv6-type echo-request -j DROP/' /etc/ufw/before6.rules
     ufw reload
-    echo "✅ ICMP 已封鎖"
+    echo -e "${GREEN}ICMP 已封鎖${RESET}" >&2
     return
   fi
 
   # IPv4
   iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
   iptables -I INPUT -p icmp --icmp-type echo-request -j DROP
-  echo "IPv4 ping已禁止"
 
   # IPv6
   # 禁止 IPv6 ping（Echo Request）
-    ip6tables -D INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT 2>/dev/null
-    ip6tables -I INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j DROP
-    echo "IPv6 ping已禁止"
-
+  ip6tables -D INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT 2>/dev/null
+  ip6tables -I INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j DROP
+  echo -e "${GREEN}ICMP 已封鎖${RESET}" >&2
   save_rules
 }
 
-allow_cf_ip(){
+allow_cf_ip() (
   if [ "$fw" = ufw ]; then
     local temp_file_v4="/tmp/cloudflare_ips_v4.txt"
     local temp_file_v6="/tmp/cloudflare_ips_v6.txt"
@@ -130,32 +133,24 @@ allow_cf_ip(){
     curl -s https://www.cloudflare.com/ips-v4 > "$temp_file_v4"
     curl -s https://www.cloudflare.com/ips-v6 > "$temp_file_v6"
 
-    echo "下載並套用 Cloudflare IPv4 規則..."
     while read -r ip; do
       if [[ -n "$ip" ]]; then
         if ! ufw status | grep -q "ALLOW.*$ip"; then
           ufw allow from "$ip"
-          echo "✅ 已添加規則：$ip"
-        else
-          echo "ℹ️ 已存在規則：$ip，跳過"
         fi
       fi
     done < "$temp_file_v4"
 
-    echo "下載並套用 Cloudflare IPv6 規則..."
     while read -r ip; do
       if [[ -n "$ip" ]]; then
         if ! ufw status | grep -q "ALLOW.*$ip"; then
           ufw allow from "$ip"
-          echo "✅ 已添加規則：$ip"
-        else
-          echo "ℹ️ 已存在規則：$ip，跳過"
         fi
       fi
     done < "$temp_file_v6"
 
     rm -f "$temp_file_v4" "$temp_file_v6"
-    echo "✅ 已完成 Cloudflare IPv4 / IPv6 規則添加。"
+    echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則添加。${RESET}"
     return
   fi
   # Cloudflare IP 列表的 URL
@@ -175,19 +170,17 @@ allow_cf_ip(){
   iptables -N $CHAIN_NAME
   ip6tables -N $CHAIN_NAME
 
-  echo "下載並添加 Cloudflare 的 IPv4 地址..."
-  while IFS= read -r ip9; do
-    if [[ "$ip9" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-      iptables -A $CHAIN_NAME -s "$ip9" -j ACCEPT
-      echo "已允許 IPv4 地址：$ip9"
+  while IFS= read -r ip; do
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+      iptables -A $CHAIN_NAME -s "$ip" -j ACCEPT
     fi
   done < <(curl -s "$CF_IPV4_URL")
 
   echo "下載並添加 Cloudflare 的 IPv6 地址..."
-  while IFS= read -r ip10; do
+  while IFS= read -r ip6; do
     if [[ "$ip10" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-      ip6tables -A $CHAIN_NAME -s "$ip10" -j ACCEPT
-      echo "已允許 IPv6 地址：$ip10"
+      ip6tables -A $CHAIN_NAME -s "$ip6" -j ACCEPT
+      echo "已允許 IPv6 地址：$ip6"
     fi
   done < <(curl -s "$CF_IPV6_URL")
 
@@ -196,9 +189,9 @@ allow_cf_ip(){
   ip6tables -A INPUT -j $CHAIN_NAME
 
   save_rules
+  echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則添加。${RESET}"
 
-  echo "Cloudflare IP 列表已成功添加到 iptables。"
-}
+)
 
 del_cf_ip(){
   if [ "$fw" = ufw ]; then
@@ -208,32 +201,24 @@ del_cf_ip(){
     curl -s https://www.cloudflare.com/ips-v4 > "$temp_file_v4"
     curl -s https://www.cloudflare.com/ips-v6 > "$temp_file_v6"
 
-    echo "刪除 Cloudflare IPv4 規則..."
     while read -r ip; do
       if [[ -n "$ip" ]]; then
         if ufw status | grep -q "ALLOW.*$ip"; then
           ufw delete allow from "$ip"
-          echo "✅ 已刪除規則：$ip"
-        else
-          echo "ℹ️ 無此規則：$ip，略過"
         fi
       fi
     done < "$temp_file_v4"
 
-    echo "刪除 Cloudflare IPv6 規則..."
     while read -r ip; do
       if [[ -n "$ip" ]]; then
         if ufw status | grep -q "ALLOW.*$ip"; then
           ufw delete allow from "$ip"
-          echo "✅ 已刪除規則：$ip"
-        else
-          echo "ℹ️ 無此規則：$ip，略過"
         fi
       fi
     done < "$temp_file_v6"
 
     rm -f "$temp_file_v4" "$temp_file_v6"
-    echo "✅ 已刪除 Cloudflare 所有 IPv4 / IPv6 規則。"
+    echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則刪除。${RESET}"
     return
   fi
 
@@ -246,24 +231,19 @@ del_cf_ip(){
   # 定義允許的 iptables 規則鏈
   local CHAIN_NAME="ALLOW_CF"
 
-  echo "正在刪除 Cloudflare 的 IPv4 地址..."
-  while IFS= read -r ip9; do
+  while IFS= read -r ip; do
     if [[ "$ip9" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-      iptables -D $CHAIN_NAME -s "$ip9" -j ACCEPT 2>/dev/null
-      echo "已刪除 IPv4 地址：$ip9"
+      iptables -D $CHAIN_NAME -s "$ip" -j ACCEPT 2>/dev/null
     fi
   done < <(curl -s "$CF_IPV4_URL")
 
-  echo "正在刪除 Cloudflare 的 IPv6 地址..."
-  while IFS= read -r ip10; do
-    if [[ "$ip10" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-      ip6tables -D $CHAIN_NAME -s "$ip10" -j ACCEPT 2>/dev/null
-      echo "已刪除 IPv6 地址：$ip10"
+  while IFS= read -r ip6; do
+    if [[ "$ip6" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
+      ip6tables -D $CHAIN_NAME -s "$ip6" -j ACCEPT 2>/dev/null
     fi
   done < <(curl -s "$CF_IPV6_URL")
 
   # 刪除規則鏈
-  echo "刪除規則鏈 $CHAIN_NAME..."
   iptables -F $CHAIN_NAME 2>/dev/null
   iptables -X $CHAIN_NAME 2>/dev/null
   ip6tables -F $CHAIN_NAME 2>/dev/null
@@ -273,7 +253,7 @@ del_cf_ip(){
 
   save_rules
 
-  echo "Cloudflare IP 規則已從 iptables 刪除。"
+  echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則刪除。${RESET}"
 }
 
 censys_block() {
@@ -306,11 +286,10 @@ censys_block() {
         local combined_ips=( "${ipv4_list[@]}" "${ipv6_list[@]}" )
 
         for ip in "${combined_ips[@]}"; do
-            echo "加入阻止規則：$ip"
             ufw deny from "$ip" 2>/dev/null
         done
 
-        echo "✅ 已將所有 CENSYS IP 加入封鎖規則"
+        echo -e "${GREEN}已將所有 CENSYS IP 加入封鎖規則${RESET}"
         return
     fi
     iptables -N CENSYS_BLOCK 2>/dev/null
@@ -326,7 +305,7 @@ censys_block() {
     for ip in "${ipv6_list[@]}"; do
       ip6tables -I CENSYS_BLOCK -s "$ip" -j DROP
     done
-    echo "[+] 規則已添加。"
+    echo -e "${GREEN}已將所有 CENSYS IP 加入封鎖規則${RESET}"
 
   elif [[ "$action" == "del" ]]; then
     if [ "$fw" = ufw ]; then
@@ -339,7 +318,7 @@ censys_block() {
             ufw delete deny from "$ip" 2>/dev/null
         done
 
-        echo "✅ 已將所有 CENSYS IP刪除封鎖規則"
+        echo -e "${GREEN}已將所有 CENSYS IP刪除封鎖規則${RESET}"
         return
     fi
     iptables -F CENSYS_BLOCK 2>/dev/null
@@ -349,10 +328,8 @@ censys_block() {
     ip6tables -F CENSYS_BLOCK 2>/dev/null
     ip6tables -D INPUT -j CENSYS_BLOCK 2>/dev/null
     ip6tables -X CENSYS_BLOCK 2>/dev/null
-    echo "[-] 規則已刪除。"
-
   else
-    echo "[!] 請使用參數：add 或 del"
+    echo -e "${YELLOW}[!] 請使用參數：add 或 del${RESET}"
   fi
 }
 
@@ -376,14 +353,15 @@ check_ip() {
     IFS='.' read -r -a octets <<< "${ip%%/*}"
     for octet in "${octets[@]}"; do
     if (( octet < 0 || octet > 255 )); then
-      echo "無效的 IP 地址：每個八位元組必須在 0-255 之間"
+      echo -e "${RED}無效的 IP 地址：每個八位元組必須在 0-255 之間${RESET}"
+      sleep 1
       return 1
     fi
     done
     if [[ "$ip" == */* ]]; then
       local cidr="${ip##*/}"
       if (( cidr < 0 || cidr > 32 )); then
-      echo "無效的 CIDR 前綴：必須在 0-32 之間"
+      echo -e "${RED}無效的 CIDR 前綴：必須在 0-32 之間${RESET}"
       return 1
       fi
     fi
@@ -409,11 +387,11 @@ check_port() {
 
     # 檢查端口是否為有效的數字
     if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        echo "⚠️ 請輸入有效的數字端口號"
+        echo -e "${YELLOW}請輸入有效的數字端口號${RESET}"
         return 1
     # 檢查端口範圍是否正確
     elif (( port < 1 || port > 65535 )); then
-        echo "⚠️ 端口號必須在 1-65535 範圍內"
+        echo -e "${YELLOW}端口號必須在 1-65535 範圍內${RESET}"
         return 1
     fi
 
@@ -422,7 +400,7 @@ check_port() {
 
     # 檢查協議是否有效
     if [[ $proto != "tcp" && $proto != "udp" ]]; then
-        echo "無效的協議類型，請使用tcp或udp"
+        echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}"
         return 1
     fi
 
@@ -431,7 +409,6 @@ check_port() {
 
 check_app() {
   if ! command -v jq >/dev/null 2>&1; then
-    echo "未偵測到 jq，正在安裝中..."
     case "$system" in 
       1)
         apt update -y
@@ -448,7 +425,6 @@ check_app() {
     esac
   fi
   if ! command -v wget >/dev/null 2>&1; then
-    echo "未偵測到 wget，正在安裝中..."
     case "$system" in 
       1)
         apt update -y
@@ -466,14 +442,16 @@ check_app() {
   fi
 }
 
+check_cli_fw() {
+  [ "$fw" == "none" ] && echo -e "${YELLOW}您好，您尚未安裝防火牆軟體，請先安裝再進行執行cli工具${RESET}" >&2 && sleep 1 && exit 1
+}
 check_fw() {
     fw="none"
     if command -v ufw >/dev/null 2>&1; then
         fw=ufw
-        menu_ufw
     elif command -v firewall-cmd >/dev/null 2>&1; then
-        echo "檢測到firewalld,請解除安裝。"
-        read -p "請按任意鍵繼續..." -n1
+        echo -e "${RED}檢測到firewalld,請解除安裝。${RESET}" >&2
+        sleep 1
         exit 1
     elif command -v iptables >/dev/null 2>&1; then
         check_iptables
@@ -483,35 +461,25 @@ check_fw() {
 check_iptables(){
   case "$system" in 
   1)
-    if dpkg -l | grep iptables-persistent &>/dev/null; then
+    if command -v netfilter-persistent > /dev/null 2>&1; then
       fw=iptables
-      menu_iptables
     fi
     ;;
   2)
     if systemctl list-unit-files | grep iptables > /dev/null 2>&1; then
       fw=iptables
-      menu_iptables
     fi
     ;;
   3)
     if rc-service iptables status > /dev/null 2>&1; then
       fw=iptables
-      menu_iptables
     fi
     ;;
   esac
 }
 check_docker(){
-  if ! command -v docker &>/dev/null; then
-    echo "跳過重啟docker規則"
-  else
-    if (( system == 1 || system == 2 )); then
-      systemctl restart docker
-      echo "Docker 已重啟。"
-    elif [ "$system" -eq 3 ]; then
-      rc-service docker restart
-    fi
+  if command -v docker &>/dev/null; then
+    service docker restart
   fi
 }
 
@@ -528,7 +496,6 @@ default_settings(){
     # 設定需要替換的路徑
     local rules_v4="/etc/iptables/rules.v4"
     local rules_v6="/etc/iptables/rules.v6"
-    echo "複製配置文件...."
     rm /etc/iptables/rules.v4 /etc/iptables/rules.v6
     # 生成規則文件
     cat > "$rules_v4" <<EOF
@@ -551,7 +518,6 @@ EOF
 :FORWARD DROP [0:0]
 :OUTPUT ACCEPT [0:0]
 
-# 允許 ICMPv6 的必要類型（不要擋這些，不然 IPv6 會掛）
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 1 -j ACCEPT
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 2 -j ACCEPT
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 3 -j ACCEPT
@@ -589,18 +555,12 @@ EOF
     else
       echo "$rules_v6 does not exist."
     fi
-    echo "正在還原...."
     iptables-restore < /etc/iptables/rules.v4
     ip6tables-restore < /etc/iptables/rules.v6
     systemctl restart netfilter-persistent
   elif [[ "$system" -eq 2 || "$system" -eq 3 ]]; then
-    if [ "$system" -eq 2 ]; then
-      systemctl stop iptables
-      systemctl stop ip6tables
-    elif [ "$system" -eq 3 ]; then
-      rc-service iptables stop
-      rc-service ip6tables stop
-    fi
+    service iptables stop
+    service ip6tables stop
     #ipv4
     iptables -F
     iptables -A INPUT -p tcp --dport $ssh_port -j ACCEPT
@@ -618,7 +578,7 @@ EOF
     ip6tables -A INPUT -i lo -j ACCEPT
     ip6tables -A FORWARD -i lo -j ACCEPT
 
-# 允許你自己的 ssh port
+    # 允許你自己的 ssh port
     ip6tables -A INPUT -p tcp --dport "$ssh_port" -j ACCEPT
 
     # ICMPv6: 允許 IPv6 正常運作必要類型
@@ -648,21 +608,17 @@ EOF
     ip6tables -P FORWARD DROP
     ip6tables -P OUTPUT ACCEPT  # 或 DROP 如果你想更嚴格控制
     save_rules
-    if [ "$system" -eq 2 ]; then
-      systemctl restart iptables
-      systemctl restart ip6tables
-    elif [ "$system" -eq 3 ]; then
-      rc-service iptables restart
-      rc-service ip6tables restart
-    fi
+    service iptables restart
+    service ip6tables restart
   fi
+  echo -e "${GREEN}配置成功！${RESET}"
   check_docker
 }
 disable_in_docker(){
   local daemon="/etc/docker/daemon.json"
   local EXTERNAL_INTERFACE=""
   if ! command -v docker &>/dev/null; then
-    echo "未安裝docker，請先安裝"
+    echo -e "${RED}未安裝docker，請先安裝${RESET}"
     sleep 1
     return 1
   fi
@@ -671,7 +627,7 @@ disable_in_docker(){
   if [ -z "$EXTERNAL_INTERFACE" ]; then
     EXTERNAL_INTERFACE=$(ip -6 route | grep default | grep -o 'dev [^ ]*' | cut -d' ' -f2)
     if [ -z "$EXTERNAL_INTERFACE" ]; then
-      echo "未找到外網網卡！"
+      echo -e "${RED}未找到外網網卡！${RESET}"
       sleep 1
       return 1
     fi
@@ -681,7 +637,7 @@ disable_in_docker(){
   if ip link show "$EXTERNAL_INTERFACE" > /dev/null 2>&1; then
     echo "偵測到外網網卡: $EXTERNAL_INTERFACE"
   else
-    echo "找不到網卡 $EXTERNAL_INTERFACE，請檢查網路配置。"
+    echo -e "${RED}找不到網卡 $EXTERNAL_INTERFACE，請檢查網路配置。${RESET}"
     sleep 1
     return 1
   fi
@@ -690,11 +646,8 @@ disable_in_docker(){
   echo "關閉外網(IPv4)進入docker內部流量。"
   if [ -f "$daemon" ] && grep -q '"ipv6": true' "$daemon"; then
     local ipv6=true
-  e
   fi
   if [[ "$ipv6" == "true" ]]; then
-    echo "偵測到 Docker 已啟用 IPv6，正在設定對應防火牆..."
-      # 檢查 ip6tables 是否存在
     ip6tables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
     echo "已關閉外網(IPv6)進入docker內部流量。"
   fi
@@ -707,22 +660,17 @@ disable_in_docker(){
   # 檢查並確保 daemon.json 是有效的 JSON
   if ! jq empty "$daemon" &>/dev/null; then
     echo '{}' > "$daemon"
-    echo "已初始化 $daemon 為空的 JSON 結構。"
   fi
       
   # 檢查並設定 "iptables": false
   if jq -e '.iptables == false' "$daemon" &>/dev/null; then
-    echo "已存在 \"iptables\": false，跳過修改。"
     open_docker_fw_service $ipv6
   else
     cp "$daemon" "$daemon.bak"
     local tmp=$(mktemp)
     jq '. + {"iptables": false}' "$daemon" > "$tmp" && mv "$tmp" "$daemon"
-    echo "已透過 jq 安全插入 \"iptables\": false。"
-          
     # 重啟 Docker 服務
     service docker restart
-          
     open_docker_fw_service $ipv6
     save_rules
   fi
@@ -731,7 +679,7 @@ disable_in_docker(){
 del_port() {
   local PROTO="$1"  # 第一個參數是協議類型
   if [ -z "$2" ]; then
-    echo "錯誤：未指定端口號"
+    echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
     return 1
   fi
   
@@ -746,7 +694,6 @@ del_port() {
       if [ -z "$PORT" ]; then
         continue  # 跳過空端口
       fi
-      echo "刪除$PROTO端口 $PORT..."
       ufw delete allow $PORT/$PROTO 2>/dev/null
       ufw delete allow $PORT 2>/dev/null
     done
@@ -756,33 +703,28 @@ del_port() {
     if [ -z "$PORT" ]; then
       continue  # 跳過空端口
     fi
-    echo "刪除$PROTO端口 $PORT..."
     local DEL_SUCCESS=0
     if iptables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo "已刪除 IPv4 $PROTO 端口 $PORT 的允許規則 (ACCEPT)"
+      echo -e "${GREEN}已刪除 IPv4 $PROTO 端口 $PORT 的允許規則 (ACCEPT)${RESET}" >&2
       DEL_SUCCESS=1
     fi
 
     if iptables -D INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      echo "已刪除 IPv4 $PROTO 端口 $PORT 的阻止規則 (DROP)"
+      echo -e "${GREEN}已刪除 IPv4 $PROTO 端口 $PORT 的阻止規則 (DROP)${RESET}" >&2
       DEL_SUCCESS=1
     fi
 
     if [[ $DEL_SUCCESS -eq 0 ]]; then
-      echo "錯誤：IPv4 $PROTO 端口 $PORT 無可刪除的規則"
+      echo -e "${RED}錯誤：IPv4 $PROTO 端口 $PORT 無可刪除的規則${RESET}" >&2
     fi
   done
-  
-  if ! save_rules; then
-    echo "錯誤：無法儲存規則"
-    return 1
-  fi
+  save_rules
   return 0
 }
 deny_port() {
   local PROTO="$1"  # 第一個參數是協議類型
   if [ -z "$2" ]; then
-    echo "錯誤：未指定端口號"
+    echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
     return 1
   fi
   
@@ -797,60 +739,46 @@ deny_port() {
       continue  # 跳過空端口
     fi
     # ipv4
-    echo "檢查並阻止$PROTO端口 $PORT..."
-    if iptables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      echo "IPv4 $PROTO 端口 $PORT 已存在，跳過開啟"
-    else
+    if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
       if iptables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-        echo "IPv4 $PROTO 端口 $PORT 已阻止"
+        echo -e "${GREEN}IPv4 $PROTO 端口 $PORT 已阻止${RESET}" >&2
       else
-        echo "錯誤：無法阻止 IPv4 $PROTO 端口 $PORT"
+        echo -e "${RED}錯誤：無法阻止 IPv4 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
     # 檢查是否允許之
     # IPv4
     if iptables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo "IPv4 $PROTO 端口 $PORT 有允許規則，將移除並阻止連線"
       iptables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null
     fi
 
     # 確認 DROP 是否已存在，避免重複插入
     if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
       iptables -I INPUT -p "$PROTO" --dport "$PORT" -j DROP
-      echo "已新增阻止 IPv4 $PROTO 端口 $PORT 的規則 (DROP)"
-    else
-      echo "IPv4 $PROTO 端口 $PORT 已有阻止規則，未重複加入"
+      echo -e "${GREEN}已新增阻止 IPv4 $PROTO 端口 $PORT 的規則 (DROP)${RESET}" >&2
     fi 
     # ipv6
-    if ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      echo "IPv6 $PROTO 端口 $PORT 已存在，跳過阻止"
-    else
+    if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
       if ip6tables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-        echo "IPv6 $PROTO 端口 $PORT 已阻止"
+        echo -e ${GREEN}"IPv6 $PROTO 端口 $PORT 已阻止${RESET}" >&2
       else
-        echo "錯誤：無法阻止 IPv6 $PROTO 端口 $PORT"
+        echo -e "${RED}錯誤：無法阻止 IPv6 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
     # 檢查是否允許之
     # IPv6
     if ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo "IPv6 $PROTO 端口 $PORT 有允許規則，將移除並阻止連線"
       ip6tables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null
     fi
 
     # 確認 DROP 是否已存在，避免重複插入
     if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
       ip6tables -I INPUT -p "$PROTO" --dport "$PORT" -j DROP
-      echo "已新增阻止 IPv6 $PROTO 端口 $PORT 的規則 (DROP)"
-    else
-      echo "IPv6 $PROTO 端口 $PORT 已有阻止規則，未重複加入"
+      echo -e "${GREEN}已新增阻止 IPv6 $PROTO 端口 $PORT 的規則 (DROP)${RESET}" >&2
     fi 
   done
   
-  if ! save_rules; then
-    echo "錯誤：無法儲存規則"
-    return 1
-  fi
+  save_rules
   return 0
 }
 
@@ -873,7 +801,7 @@ open_docker_fw_service() {
       
       # 【核心修改】使用 sh -c 來安全地執行兩個腳本
       # 這確保了無論是 systemd 還是 openrc 都能正確處理
-      service_command="/bin/bash -c '/etc/fw/docker.sh && /etc/fw/docker-v6.sh'"
+      service_command="/bin/bash -c '/etc/fw/docker.sh & /etc/fw/docker-v6.sh &'"
     fi
 
     case $system in
@@ -1080,23 +1008,16 @@ save_rules() {
     return
   fi
   if [ "$system" -eq 1 ]; then
-    echo "儲存防火牆規則中..."
-
-    mkdir -p /etc/iptables
-
-    iptables-save > /etc/iptables/rules.v4
-    ip6tables-save > /etc/iptables/rules.v6
-    iptables-restore < /etc/iptables/rules.v4
-    ip6tables-restore < /etc/iptables/rules.v6
+    netfilter-persistent save >/dev/null 2>&1
   elif [ "$system" -eq 2 ]; then
     # 儲存規則
-    service iptables save
-    service ip6tables save
+    service iptables save >/dev/null 2>&1
+    service ip6tables save >/dev/null 2>&1
   elif [ "$system" -eq 3 ]; then
-    /etc/init.d/iptables save
-    /etc/init.d/ip6tables save
+    /etc/init.d/iptables save >/dev/null 2>&1
+    /etc/init.d/ip6tables save >/dev/null 2>&1
   else
-    echo "此系統目前尚未支援自動儲存規則。"
+    echo -e "${RED}此系統目前尚未支援自動儲存規則。${RESET}" >&2
   fi
 }
 
@@ -1106,44 +1027,42 @@ update_script() {
   local current_script="/usr/local/bin/fw"
   local current_path="$0"
 
-  echo "🔍 正在檢查更新..."
+  echo "正在檢查更新..."
   wget -q "$download_url" -O "$temp_path"
   if [ $? -ne 0 ]; then
-    echo "❌ 無法下載最新版本，請檢查網路連線。"
+    echo -e "${RES}無法下載最新版本，請檢查網路連線。${RESET}"
     return
   fi
 
   # 比較檔案差異
   if [ -f "$current_script" ]; then
     if diff "$current_script" "$temp_path" >/dev/null; then
-      echo "✅ 腳本已是最新版本，無需更新。"
       rm -f "$temp_path"
       return
     fi
-    echo "📦 檢測到新版本，正在更新..."
+    echo -e "${YELLOW}檢測到新版本，正在更新...${RESET}"
     cp "$temp_path" "$current_script" && chmod +x "$current_script"
     if [ $? -eq 0 ]; then
-      echo "✅ 更新成功！將自動重新啟動腳本以套用變更..."
+      echo -e ${GREEN} "更新成功！將自動重新啟動腳本以套用變更...${RESET}"
       sleep 1
       exec "$current_script"
     else
-      echo "❌ 更新失敗，請確認權限。"
+      echo -e "${RED}更新失敗，請確認權限。${RESET}"
     fi
   else
     # 非 /usr/local/bin 執行時 fallback 為當前檔案路徑
     if diff "$current_path" "$temp_path" >/dev/null; then
-      echo "✅ 腳本已是最新版本，無需更新。"
       rm -f "$temp_path"
       return
     fi
-    echo "📦 檢測到新版本，正在更新..."
+    echo "檢測到新版本，正在更新..."
     cp "$temp_path" "$current_path" && chmod +x "$current_path"
     if [ $? -eq 0 ]; then
-      echo "✅ 更新成功！將自動重新啟動腳本以套用變更..."
+      echo -e "${GREEN}更新成功！將自動重新啟動腳本以套用變更...${RESET}"
       sleep 1
       exec "$current_path"
     else
-      echo "❌ 更新失敗，請確認權限。"
+      echo -e "${RED}更新失敗，請確認權限。${RESET}"
     fi
   fi
 
@@ -1601,6 +1520,13 @@ menu_del_port(){
     esac
   
 }
+munu_fw() {
+  if [[ $fw == ufw ]]; then
+    menu_ufw
+  elif [[ $fw == iptables ]]; then
+    menu_iptables
+  fi
+}
 
 menu_ufw(){
     while true; do
@@ -1804,48 +1730,76 @@ case "$1" in
     echo "Linux防火牆管理器版本$version"
     exit 0
     ;;
+  help|--help|-h)
+    echo "用法："
+    echo "fw <open/deny/del> port <port（用空白鍵分端口，例如：10 20 30 40）> <tcp/udp>"
+    echo "fw <open/deny/del> ip <ip> <tcp/udp>"
+    echo "fw <open/deny/del> ip_port <ip> <port>"
+    exit 0
+    ;;
 esac
 
 # 初始化
 check_system
 check_app
 check_fw
-menu_install_fw
+[[ ! -z $1 ]] && check_cli_fw
 case "$1" in
-    open)
-        shift  # 移動到端口參數
-        if [ -z "$1" ]; then
-            echo "錯誤：未指定端口號"
-            exit 1
+  open|deny|del)
+    act_iptables=ACCEPT
+    act_ufw=allow
+    [ $1 == del ] && act1_ufw=delete
+    [ $1 == deny ] && act_iptable=DROP && act_ufw=deny
+    if [[ $2 == port ]]; then
+      original_action="$1"
+      shift 2
+      if [ -z "$1" ]; then
+        echo "錯誤：未指定端口號"
+        exit 1
+      fi
+      PROTO="tcp"  # 默認為tcp
+      LAST_ARG="${@: -1}"  # 獲取最後一個參數
+      [[ $LAST_ARG != "tcp" && $LAST_ARG != "udp" ]] && echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}" >&2 && exit 1
+      if [[ "$LAST_ARG" == "tcp" || "$LAST_ARG" == "udp" ]]; then
+        PROTO="$LAST_ARG"
+        set -- "${@:1:$(($#-1))}"
+      fi
+      [ $original_action == open ] && allow_port "$PROTO" "$@"
+      [ $original_action == del ] && del_port "$PROTO" "$@"
+      [ $original_action == deny ] && deny_port "$PROTO" "$@"
+    elif [[ $2 == ip ]]; then
+      [ -z "$3" ] && fw help
+      [ $fw == ufw ] && ufw $act1_ufw $act_ufw from "$3" 
+      if [ $fw == iptables ]; then
+        proto_cli=${4:-tcp}
+        [[ $proto_cli != "tcp" && $proto_cli != "udp" ]] && echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}" >&2 && exit 1
+        if [ $1 == del ]; then
+          [[ "$3" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && (iptables -D INPUT -s "$3" -p "$proto_cli" -j ACCEPT >/dev/null 2>&1 || iptables -D INPUT -s "$3" -p "$proto_cli" -j DROP >/dev/null 2>&1)
+          [[ "$3" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]] && (ip6tables -D INPUT -s "$3" -p "$proto_cli" -j ACCEPT >/dev/null 2>&1 || ip6tables -D INPUT -s "$3" -p "$proto_cli" -j DROP >/dev/null 2>&1)
+        else
+          [[ "$3" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && iptables -A INPUT -s "$3" -p "$proto_cli" -j $act_iptables
+          [[ "$3" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]] && ip6tables -A INPUT -s "$3" -p "$proto_cli" -j $act_iptables
         fi
-        PROTO="tcp"  # 默認為tcp
-        LAST_ARG="${@: -1}"  # 獲取最後一個參數
-        if [[ "$LAST_ARG" == "tcp" || "$LAST_ARG" == "udp" ]]; then
-            PROTO="$LAST_ARG"
-            # 移除最後一個參數（協議）從參數列表
-            set -- "${@:1:$(($#-1))}"
+        save_rules
+      fi
+    elif [[ $2 == ip_port ]]; then
+      [[ -z "$3" || -z "$4" ]] && fw help
+      proto_cli=${4:-tcp}
+      [[ $proto_cli != "tcp" && $proto_cli != "udp" ]] && echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}" >&2 && exit 1
+      [ $fw == ufw ] && ufw $act1_ufw $act_ufw from "$3" to any port "$4" proto "$proto_cli"
+      if [ $fw == iptables ]; then
+        if [ $1 == del ]; then
+          [[ "$3" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && (iptables -D INPUT -p "$proto_cli" -s $3 --dport $4 -j ACCEPT >/dev/null 2>&1 || iptables -D INPUT -p "$proto_cli" -s $3 --dport $4 -j DROP >/dev/null 2>&1)
+          [[ "$3" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]] && (ip6tables -D INPUT -p "$proto_cli" -s $3 --dport $4 -j ACCEPT >/dev/null 2>&1 || ip6tables -D INPUT -p "$proto_cli" -s $3 --dport $4 -j DROP >/dev/null 2>&1)
+        else
+          [[ "$3" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && iptables -A INPUT -p "$proto_cli" -s "$3" --dport "$4" -j $act_iptables
+          [[ "$3" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]] && ip6tables -A INPUT -p "$proto_cli" -s "$3" --dport "$4" -j $act_iptables
         fi
-        allow_port "$PROTO" "$@"
-        echo "端口已開啟"
-        exit 0
-        ;;
-    del)
-        shift  # 移動到端口參數
-        if [ -z "$1" ]; then
-            echo "錯誤：未指定端口號"
-            exit 1
-        fi
-        PROTO="tcp"  # 默認為tcp
-        LAST_ARG="${@: -1}"  # 獲取最後一個參數
-        if [[ "$LAST_ARG" == "tcp" || "$LAST_ARG" == "udp" ]]; then
-            PROTO="$LAST_ARG"
-            # 移除最後一個參數（協議）從參數列表
-            set -- "${@:1:$(($#-1))}"
-        fi
-        del_port "$PROTO" "$@"
-        echo "端口已刪除"
-        exit 0
-        ;;
+        save_rules
+      fi
+    fi
+    exit 0
+    ;;
     blockping)
       block_ping
       exit 0
@@ -1855,3 +1809,5 @@ case "$1" in
       exit 0
       ;;
 esac
+menu_install_fw
+munu_fw
