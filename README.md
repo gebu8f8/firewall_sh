@@ -19,6 +19,8 @@
 - ✅ 可快速切換 IPv4 / IPv6
 
 - ✅ 支援 Debian / Ubuntu / CentOS / Alpine
+  
+- ✅ 支援 CLI模式,參考[CLI文檔](https://blog.gebu8f.com/fw_cli/)
 
 
 
