@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="5.0.0"
+version="6.0.1"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -94,11 +94,15 @@ allow_ping() {
   fi
 
   # IPv4
-  iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null
-  iptables -I INPUT -p icmp --icmp-type echo-request -j ACCEPT
+  if iptables -C INPUT -p icmp --icmp-type echo-request -j DROP >/dev/null; then
+    iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+  fi
   # IPv6
-  ip6tables -D INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP 2>/dev/null
-  ip6tables -I INPUT -p ipv6-icmp --icmpv6-type 128 -j ACCEPT
+  if ip6tables -C INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP >/dev/null; then
+    ip6tables -D INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP 2>/dev/null
+    ip6tables -A INPUT -p ipv6-icmp --icmpv6-type 128 -j ACCEPT
+  fi
   echo -e "${GREEN}ICMP 已開啟${RESET}" >&2
 
   save_rules
@@ -114,13 +118,16 @@ block_ping() {
   fi
 
   # IPv4
-  iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
-  iptables -I INPUT -p icmp --icmp-type echo-request -j DROP
+  if iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT >/dev/null; then
+    iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
+    iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+  fi
 
   # IPv6
-  # 禁止 IPv6 ping（Echo Request）
-  ip6tables -D INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT 2>/dev/null
-  ip6tables -I INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j DROP
+  if ip6tables -C INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT >/dev/null; then
+    ip6tables -D INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT 2>/dev/null
+    ip6tables -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j DROP
+  fi
   echo -e "${GREEN}ICMP 已封鎖${RESET}" >&2
   save_rules
 }
@@ -848,73 +855,11 @@ EOF
     echo "Docker 防火牆服務已設定並啟動。"
 }
 
-# 設置速率限制以防禦DDoS攻擊
-rate_limit_port() {
-  if [ -z "$1" ]; then
-    echo "錯誤：未指定端口號"
-    return 1
-  fi
-    
-  local PORT=$1
-  local PROTO=${2:-tcp}  # 默認為TCP協議
-  local RATE=${3:-10}    # 默認速率限制為每分鐘10次連接
-  local BURST=${4:-20}   # 默認突發量為20
-  
-  # 檢查端口是否有效
-  check_port "$PORT" "$PROTO"
-  result=$?
-  if [[ $result -ne 0 ]]; then
-    return 1
-  fi
-  
-  echo "設置$PROTO端口 $PORT 的速率限制..."
-  # IPv4 速率限制
-  iptables -A INPUT -p $PROTO --dport $PORT -m limit --limit $RATE/minute --limit-burst $BURST -j ACCEPT
-  iptables -A INPUT -p $PROTO --dport $PORT -j DROP
-  echo "IPv4 $PROTO 端口 $PORT 已設置速率限制為每分鐘 $RATE 次，突發量 $BURST"
-  
-  # IPv6 速率限制
-  ip6tables -A INPUT -p $PROTO --dport $PORT -m limit --limit $RATE/minute --limit-burst $BURST -j ACCEPT
-  ip6tables -A INPUT -p $PROTO --dport $PORT -j DROP
-  echo "IPv6 $PROTO 端口 $PORT 已設置速率限制為每分鐘 $RATE 次，突發量 $BURST"
-  
-  save_rules
-}
 
-# 移除速率限制
-remove_rate_limit_port() {
-  if [ -z "$1" ]; then
-    echo "錯誤：未指定端口號"
-    return 1
-  fi
-  
-  local PORT=$1
-  local PROTO=${2:-tcp}  # 默認為TCP協議
-  
-  # 檢查端口是否有效
-  check_port "$PORT" "$PROTO"
-  result=$?
-  if [[ $result -ne 0 ]]; then
-    return 1
-  fi
-  
-  echo "移除$PROTO端口 $PORT 的速率限制..."
-    # 針對 IPv4 刪除所有該端口的相關規則
-  # IPv4
-  iptables-save | grep -E "\-A INPUT .*-p $PROTO .*--dport $PORT" | while read -r line; do
-    rule=$(echo "$line" | sed 's/^-A /-D /')
-    iptables $rule 2>/dev/null && echo "已刪除 IPv4 規則: $rule"
-    done
 
-  # IPv6
-  ip6tables-save | grep -E "\-A INPUT .*-p $PROTO .*--dport $PORT" | while read -r line; do
-    rule=$(echo "$line" | sed 's/^-A /-D /')
-    ip6tables $rule 2>/dev/null && echo "已刪除 IPV6規則: $rule"
-    done
-  save_rules
-}
-
-setup_iptables() {
+install_fw() {
+  local type="$1"
+  if [ $type == iptables ]; then
     case $system in
     1)
       apt update
@@ -924,9 +869,9 @@ setup_iptables() {
       confirm=${confirm,,}  # 轉小寫
       confirm=${confirm:-y}
       if [[ "$confirm" == "y" || "$confirm" == "" ]]; then
-      default_settings
+        default_settings
       else
-        echo "跳過基礎配置。"
+        systemctl start netfilter-persistent
       fi
       ;;
     2)
@@ -935,77 +880,61 @@ setup_iptables() {
       read -p "是否執行基礎防火牆配置？(Y/n): [預設為是]" confirm
       confirm=${confirm,,}  # 轉小寫
       confirm=${confirm:-y}
+      systemctl enable ip6tables
+      systemctl enable iptables
       if [[ "$confirm" == "y" || "$confirm" == "" ]]; then
         default_settings
-        systemctl enable iptables
-        systemctl start iptables
-        systemctl enable ip6tables
-        systemctl start ip6tables
       else
-        echo "正在開啟防火牆"
-        systemctl enable iptables
         systemctl start iptables
-        systemctl enable ip6tables
         systemctl start ip6tables
-       fi
+      fi
       ;;
     3)
       apk update
       apk add iptables ip6tables
       read -p "是否執行基礎防火牆配置？(Y/n): [預設為是]" confirm
-      confirm=${confirm,,}  # 轉小寫
-      confirm=${confirm:-y}
+      confirm=${confirm,,:-y}  # 轉小寫
+      rc-update add iptables
+      rc-update add ip6tables
       if [[ "$confirm" == "y" || "$confirm" == "" ]]; then
         default_settings
-        rc-service iptables start
-        rc-service ip6tables start
-        rc-update add iptables
-        rc-update add ip6tables
       else
-        echo "正在開啟防火牆"
         rc-service iptables start
         rc-service ip6tables start
-        rc-update add iptables
-        rc-update add ip6tables
       fi
     ;;
     esac
     check_fw
     menu_iptables
-}
-
-setup_ufw(){
-  case "$system" in
-  1) 
+  elif [ $type == ufw ]; then
+    case "$system" in
+    1) 
     apt update
     apt install ufw -y
     ;;
-  2)
-    echo -e "${RED}您好,您的系統不支持ufw,請安裝iptables${RESET}"
-    read -p "操作完成,請按任意鍵繼續..." -n1
-    return 1
-    ;;
-  3)
-    apk update
-    apk add ufw
-    ;;
-  esac
-  local ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}')
-  # 如果未設定Port則預設為22
-  if [[ -z "$ssh_port" ]]; then
-    ssh_port=22
+    2)
+      echo -e "${RED}您好,您的系統不支持ufw,請安裝iptables${RESET}"
+      sleep 0.5
+      exit 1
+      ;;
+    3)
+      apk update
+      apk add ufw
+      ;;
+    esac
+    local ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}')
+    [[ -z "$ssh_port" ]] && ssh_port=22
+    ufw allow $ssh_port/tcp
+    echo "y" | ufw enable
+    echo -e "${GREEN}UFW 防火牆已啟用${RESET}"
+    check_fw
+    menu_ufw
   fi
-  echo "SSH端口是：$ssh_port"
-  ufw allow $ssh_port/tcp
-  echo "啟用 UFW 防火牆..."
-  echo "y" | ufw enable
-  echo "UFW 防火牆已啟用"
-  check_fw
-  menu_ufw
 }
+
 save_rules() {
   if [ $fw = ufw ]; then
-    return
+    return 0
   fi
   if [ "$system" -eq 1 ]; then
     netfilter-persistent save >/dev/null 2>&1
@@ -1027,10 +956,9 @@ update_script() {
   local current_script="/usr/local/bin/fw"
   local current_path="$0"
 
-  echo "正在檢查更新..."
   wget -q "$download_url" -O "$temp_path"
   if [ $? -ne 0 ]; then
-    echo -e "${RES}無法下載最新版本，請檢查網路連線。${RESET}"
+    echo -e "${RED}無法下載最新版本，請檢查網路連線。${RESET}"
     return
   fi
 
@@ -1043,483 +971,502 @@ update_script() {
     echo -e "${YELLOW}檢測到新版本，正在更新...${RESET}"
     cp "$temp_path" "$current_script" && chmod +x "$current_script"
     if [ $? -eq 0 ]; then
-      echo -e ${GREEN} "更新成功！將自動重新啟動腳本以套用變更...${RESET}"
+      echo -e "${GREEN}更新成功！將自動重新啟動腳本以套用變更...${RESET}"
       sleep 1
       exec "$current_script"
     else
       echo -e "${RED}更新失敗，請確認權限。${RESET}"
     fi
-  else
-    # 非 /usr/local/bin 執行時 fallback 為當前檔案路徑
-    if diff "$current_path" "$temp_path" >/dev/null; then
-      rm -f "$temp_path"
-      return
-    fi
-    echo "檢測到新版本，正在更新..."
-    cp "$temp_path" "$current_path" && chmod +x "$current_path"
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}更新成功！將自動重新啟動腳本以套用變更...${RESET}"
-      sleep 1
-      exec "$current_path"
-    else
-      echo -e "${RED}更新失敗，請確認權限。${RESET}"
-    fi
   fi
-
   rm -f "$temp_path"
 }
 
-menu_advanced(){
-  local choice
-  clear
-  echo -e "\033[1;32m進階功能\033[0m"
-  echo -e "\033[1;34m------------------------\033[0m"
-  echo -e "\033[1;36m1. 設置DDoS防護速率限制    2. 移除DDoS防護速率限制\033[0m"
-    echo ""
-    echo -e "\033[1;36m3. 阻止端口訪問（INPUT）\033[0m"
-    echo ""
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;31m0. 退出\033[0m"
-  echo -n -e "\033[1;33m請選擇操作 [0-3]: \033[0m"
-  read -r choice
-  case $choice in
-  1)
-    clear
-    echo -e "\033[1;32m設置DDoS防護速率限制\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    read -p "請輸入要設置速率限制的端口號: " port
-    read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-    read -p "請輸入每分鐘允許的連接數(默認10): " rate
-    read -p "請輸入突發量(默認20): " burst
-    check_port "$port" "$proto"
-    local proto=${proto:-tcp}
-    result=$?
-    if [[ $result -eq 0 ]]; then
-      rate_limit_port "$port" "$proto" "$rate" "$burst"
-      save_rules
+menu_allow_port() {
+  local input clean_input items item ip port
+  local proto_choice proto
+
+  read -p "輸入 IP 或端口 (可多個，範圍80-82，用逗號/空格): " input
+  [[ -z "$input" ]] && return 0
+
+  clean_input="${input//,/ }"
+  items=()
+
+  for token in $clean_input; do
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local s=${BASH_REMATCH[1]}
+      local e=${BASH_REMATCH[2]}
+      for ((p=s; p<=e; p++)); do items+=("$p"); done
+    else
+        items+=("$token")
     fi
-    read -p "按任意鍵繼續..." -n1
-    ;;
-  2)
-    clear
-    echo -e "\033[1;32m移除DDoS防護速率限制\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    read -p "請輸入要移除速率限制的端口號: " port
-    read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-    check_port "$port" "$proto"
-    result=$?
-    if [[ $result -eq 0 ]]; then
-      remove_rate_limit_port "$port" "$proto"
+  done
+
+  for item in "${items[@]}"; do
+    if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ : ]]; then
+      ip="$item"
+      read -p "開放特定端口? (輸入 0 或直接 Enter 代表全部開放): " port
+            
+      if [[ -z "$port" || "$port" == "0" ]]; then
+        echo -e "\033[1;36m-> 僅放行 IP (All Ports)\033[0m"
+
+        # UFW
+        if [ $fw == ufw ]; then
+          ufw allow from "$ip" >/dev/null
+          echo -e "${GREEN}已放行 $ip${RESET}"
+        elif [ $fw == iptables ]; then
+          if [[ "$ip" =~ : ]]; then
+            # IPv6
+            ip6tables -A INPUT -s "$ip" -j ACCEPT
+            echo -e "${GREEN}已放行 $ip${RESET}"
+          else
+            # IPv4
+            iptables -A INPUT -s "$ip" -j ACCEPT
+            echo -e "${GREEN}已放行 $ip${RESET}"
+          fi
+        fi
+        continue
+      fi
+      printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
+      read -p "請選擇協議: " proto_choice
+      case "$proto_choice" in
+      2) proto="udp" ;;
+      3) proto="all" ;;
+      *) proto="tcp" ;;
+      esac
+
+      # UFW
+      if [ $fw == ufw ]; then
+        if [[ "$proto" == "all" ]]; then
+          ufw allow from "$ip" to any port "$port" proto tcp >/dev/null
+          ufw allow from "$ip" to any port "$port" proto udp >/dev/null
+        else
+          ufw allow from "$ip" to any port "$port" proto "$proto" >/dev/null
+        fi
+        echo -e "${GREEN}規則已添加${RESET}"
+      elif [ $fw == iptables ]; then
+        if [[ "$ip" =~ : ]]; then
+          # IPv6
+          if [[ "$proto" == "all" ]]; then
+            ip6tables -A INPUT -s "$ip" -p tcp --dport "$port" -j ACCEPT
+            ip6tables -A INPUT -s "$ip" -p udp --dport "$port" -j ACCEPT
+          else
+            ip6tables -A INPUT -s "$ip" -p $proto --dport "$port" -j ACCEPT
+          fi
+        else
+          if [[ "$proto" == "all" ]]; then
+            iptables -A INPUT -s "$ip" -p tcp --dport "$port" -j ACCEPT
+            iptables -A INPUT -s "$ip" -p udp --dport "$port" -j ACCEPT
+          else
+            iptables -A INPUT -s "$ip" -p $proto --dport "$port" -j ACCEPT
+          fi
+        fi
+        echo -e "${GREEN}規則已添加${RESET}"
+      fi
+      continue
     fi
-    read -p "按任意鍵繼續..." -n1
-    ;;
-  3)
-    clear
-    menu_deny_port
-    ;;
-  0)
-    return 0
-    ;;
-  esac
-}
-
-menu_allow_port(){
-    local choice
-    clear
-    echo -e "\033[1;32m開啟端口\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;36m1. 開放指定端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m2. 開放指定IP及端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m3. 指定IP\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;31m0. 返回\033[0m"
-    echo -n -e "\033[1;33m請選擇操作 [0-3]: \033[0m"
-    read -r choice
-    case $choice in
-    1)
-      clear
-      echo "開放指定端口"
-      echo "------------------------"
-      read -p "請輸入要開啟的端口號（可輸入多個端口，用空格分隔）: " -a ports
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      for port in "${ports[@]}"; do
-        check_port "$port" "$proto"
-        result=$?
-        if [[ $result -ne 0 ]]; then
-          break
-        fi
-      done
-      allow_port "$proto" "${ports[@]}"
-      save_rules
-      read -p "操作完成，按任意鍵繼續..." -n1
-      ;;
-    2)
-      # 請用戶輸入 IP 和端口
-      read -p "請輸入要開放的端口: " port
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      check_port "$port" "$proto"
-      result=$?
-      if [[ $result -eq 0 ]]; then
-        local proto=${proto:-tcp}
-        read -p "請輸入要開放的 IP 地址（支持單個IP或網段，如 192.168.1.0/24）: " ip
-        check_ip "$ip"
-        ip_result=$?
-        if [[ $ip_result -eq 0 ]]; then
-          if [ $fw = ufw ]; then
-            ufw allow from "$ip" to any port "$port" proto "$proto"
-            return
-          fi
-          if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-            # IPv4 處理
-            echo "檢測到 IPv4 地址/網段，將開放該地址的端口..."
-            if iptables -A INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null; then
-              echo "IPv4 端口 $port 已開放給 $ip 協議為 $proto"
-              save_rules
-            else
-              echo "錯誤：無法為 IPv4 地址 $ip 開放端口 $port"
-            fi
-          elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-            # IPv6 處理
-            echo "檢測到 IPv6 地址/網段，將開放該地址的端口..."
-            if ip6tables -A INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null; then
-              echo "IPv6 端口 $port 已開放給 $ip 協議為 $proto"
-              save_rules
-            else
-              echo "錯誤：無法為 IPv6 地址 $ip 開放端口 $port"
-            fi
-          fi
-        fi
-      fi
-      ;;
-    3)
-      read -p "請輸入要開放的 IP 地址（支持單個IP或網段，如 192.168.1.0/24）: " ip
-      check_ip "$ip"
-      ip_result=$?
-      if [[ $ip_result -eq 0 ]]; then
-        if [ $fw = ufw ]; then
-          ufw allow from "$ip"
-          return
-        fi
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-          # IPv4 處理
-          read -p "要開放的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            break
-          else
-            if iptables -A INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null; then
-              save_rules
-            else
-              echo "錯誤：無法為 IPv4 地址 $ip 開放協議 $proto"
-            fi
-          fi
-        elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-          # IPv6 處理
-          read -p "要開放的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            break
-          else
-            if ip6tables -A INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null; then
-              save_rules
-            else
-              echo "錯誤：無法為 IPv6 地址 $ip 開放協議 $proto"
-            fi
-          fi
-        fi
-      fi
-      ;;
+    port="$item"
+    printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
+    read -p "請選擇協議: " proto_choice
+    case "$proto_choice" in
+    2) proto="udp" ;;
+    3) proto="all" ;;
+    *) proto="tcp" ;;
     esac
-}
 
-menu_deny_port(){
-    local choice
-    clear
-    echo -e "\033[1;32m阻止端口訪問\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;36m1. 阻止指定端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m2. 阻止指定IP及端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m3. 指定IP\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;31m0. 返回\033[0m"
-    echo -n -e "\033[1;33m請選擇操作 [0-3]: \033[0m"
-    read -r choice
-    case $choice in
-    1)
-      clear
-      echo "阻止指定端口"
-      echo "------------------------"
-      read -p "請輸入要阻止的端口號（可輸入多個端口，用空格分隔）: " -a ports
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      local valid=true
-      for port in "${ports[@]}"; do
-        check_port "$port" "$proto"
-        result=$?
-        if [[ $result -ne 0 ]]; then
-          valid=false
-          break
-        fi
-      done
-      if [[ $valid == true ]]; then
-        deny_port "$proto" "${ports[@]}"
-        save_rules
-      fi
-      read -p "操作完成，按任意鍵繼續..." -n1
-      ;;
-    2)
-      # 請用戶輸入 IP 和端口
-      read -p "請輸入要阻止的端口: " port
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      check_port "$port" "$proto"
-      result=$?
-      if [[ $result -eq 0 ]]; then
-        proto=${proto:-tcp}
-        read -p "請輸入要阻止的 IP 地址（支持單個IP或網段，如 192.168.1.0/24）: " ip
-        check_ip "$ip"
-        ip_result=$?
-        if [[ $ip_result -eq 0 ]]; then
-          if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-            # IPv4 處理
-            echo "檢測到 IPv4 地址/網段，將阻止該地址的端口..."
-            if iptables -C INPUT -p "$proto" -s "$ip" --dport "$port" -j DROP 2>/dev/null; then
-              echo "IPv4 $proto 端口 $port 已存在，跳過之"
-            else
-              iptables -A INPUT -p "$proto" -s "$ip" --dport "$port" -j DROP 2>/dev/null
-              echo "IPv4 $proto 端口 $port 之指定ip $ip 已阻止"
-            fi
-            if iptables -C INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null; then
-              echo "IPv4 $proto 端口 $port之指定ip $ip 有允許規則，將移除並阻止連線"
-              iptables -D INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null
-            fi
-            save_rules
-          elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-            # IPv6 處理
-            echo "檢測到 IPv6 地址/網段，將阻止該地址的端口..."
-            if ip6tables -C INPUT -p "$proto" -s "$ip" --dport "$port" -j DROP 2>/dev/null; then
-              echo "IPv6 $proto 端口 $port 已存在，跳過之"
-            else
-              ip6tables -A INPUT -p "$proto" -s "$ip" --dport "$port" -j DROP 2>/dev/null
-              echo "IPv6 $proto 端口 $port 之指定ip $ip 已阻止"
-            fi
-            if ip6tables -C INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null; then
-              echo "IPv6 $proto 端口 $port之指定ip $ip 有允許規則，將移除並阻止連線"
-              ip6tables -D INPUT -p "$proto" -s "$ip" --dport "$port" -j ACCEPT 2>/dev/null
-            fi
-            save_rules
-          fi
-        fi
-      fi
-      ;;
-    3)
-      read -p "請輸入要阻止的 IP 地址（支持單個IP或網段，如 192.168.1.0/24）: " ip
-      check_ip "$ip"
-      ip_result=$?
-      if [[ $ip_result -eq 0 ]]; then
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-          # IPv4 處理
-          read -p "要阻止的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            break
-          else
-            if iptables -C INPUT -s "$ip" -p "$proto" -j DROP 2>/dev/null; then
-              echo "IPv4 $proto 指定IP $ip 已存在，跳過"
-            else
-              iptables -A INPUT -s "$ip" -p "$proto" -j DROP 2>/dev/null
-              echo "IPv4 $proto 指定IP $ip 已阻止"
-            fi
-            if iptables -C INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null; then
-              echo "IPv4 $proto 指定IP $ip 有允許規則，將移除並阻止連線"
-              iptables -D INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null
-            fi
-            save_rules
-          fi
-        elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-          # IPv6 處理
-          read -p "要阻止的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            break
-          else
-            if ip6tables -C INPUT -s "$ip" -p "$proto" -j DROP 2>/dev/null; then
-              echo "IPv6 $proto 指定IP $ip 已存在，跳過"
-            else
-              ip6tables -A INPUT -s "$ip" -p "$proto" -j DROP 2>/dev/null
-              echo "IPv6 $proto 指定IP $ip 已阻止"
-            fi
-            if ip6tables -C INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null; then
-              echo "IPv6 $proto 指定IP $ip1 有允許規則，將移除並阻止連線"
-              ip6tables -D INPUT -s "$ip" -p "$proto" -j ACCEPT 2>/dev/null
-            fi
-            save_rules
-          fi
-        fi
-      fi
-      ;;
-    esac
-}
-
-menu_del_port(){
-    local choice
-    clear
-    echo -e "\033[1;32m刪除端口\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;36m1. 數字式刪除（適合量少）\033[0m"
-    echo ""
-    echo -e "\033[1;36m2. 刪除指定端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m3. 刪除指定IP加端口\033[0m"
-    echo ""
-    echo -e "\033[1;36m4. 刪除指定IP\033[0m"
-    echo -e "\033[1;34m------------------------\033[0m"
-    echo -e "\033[1;31m0. 返回\033[0m"
-    echo -n -e "\033[1;33m請選擇操作 [0-4]: \033[0m"
-    read -r choice
-    case $choice in
-    1)
-      if [ $fw = ufw ]; then
-        ufw status numbered
-        read -p "請輸入數字:ex [1] ...30/tcp...的1 " number
-        ufw delete "$number"
+    # UFW
+    if command -v ufw >/dev/null; then
+      if [[ "$proto" == "all" ]]; then
+        ufw allow "$port" >/dev/null # UFW 預設 allow 80 會同時開 tcp/udp
+        echo "${GREEN}端口 $port 已開放${RESET}"
       else
-        clear
-        local choice
-        echo "數字式刪除"
-        echo "------------------------"
-        echo "1. ipv4"
-        echo ""
-        echo "2. ipv6"
-        echo '------------------------'
-        echo "0. 返回"
-        echo -n "請選擇操作 [0-2]: "
-        read -r choice
-        case $choice in
-        1)
-          clear
-          iptables -L INPUT --line-numbers
-          read -p "請輸入數字：" number
-          iptables -D INPUT "$number"
-          save_rules
-          ;;
-        2)
-          clear
-          ip6tables -L INPUT --line-numbers
-          read -p "請輸入數字：" number
-          ip6tables -D INPUT "$number"
-          save_rules
-          ;;
-        0)
-          return 0
-          ;;
-        esac
+        ufw allow "$port"/"$proto" >/dev/null
+        echo -e "${GREEN}端口 $port ($proto) 已開放${RESET}"
       fi
-      ;;
-    2)
-      clear
-      echo "刪除指定端口"
-      echo "------------------------"
-      read -p "請輸入要刪除的端口號（可輸入多個端口，用空格分隔）: " -a ports
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      local valid=true
-      for port in "${ports[@]}"; do
-        check_port "$port" "$proto"
-        result=$?
-        if [[ $result -ne 0 ]]; then
-          valid=false
-          break
+    elif [ $fw == iptables ]; then
+      if [[ "$proto" == "all" ]]; then
+        # TCP
+        iptables  -A INPUT -p tcp --dport "$port" -j ACCEPT
+        ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        # UDP
+        iptables  -A INPUT -p udp --dport "$port" -j ACCEPT
+        ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
+      else
+        iptables  -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+        ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      fi
+      echo -e "${GREEN}端口 $port ($proto) 已開放 (IPv4+IPv6)${RESET}"
+    fi
+    continue
+  done
+
+  save_rules
+  echo -e "${GREEN}所有規則處理完畢。${RESET}"
+  sleep 1.5
+}
+
+menu_del_port() {
+  local input clean_input search_targets 
+  local matches_ufw matches_ipt matches_ip6t display_list
+  
+  read -p "輸入端口或IP (0返回, 支援範圍 80-82): " input
+  [[ "$input" == "0" ]] && return 0
+
+  clean_input="${input//,/ }"
+  search_targets=()
+    
+  for token in $clean_input; do
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local start=${BASH_REMATCH[1]}
+      local end=${BASH_REMATCH[2]}
+      for ((p=start; p<=end; p++)); do search_targets+=("$p"); done
+    else
+        search_targets+=("$token")
+    fi
+  done
+
+  for target in "${search_targets[@]}"; do
+    # 判斷是否為 IP (IPv4 或 IPv6)
+    # 判斷依據：符合 IPv4 格式 或 包含冒號 (IPv6 特徵)
+    if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$target" =~ : ]]; then
+      
+      # 重置陣列
+      matches_ufw=()
+      matches_ipt=()
+      matches_ip6t=()
+            
+      # 1. 搜 UFW (UFW 會混合顯示 v4/v6，邏輯不變)
+      if command -v ufw >/dev/null; then
+        while read -r line; do
+          local num=$(echo "$line" | grep -oP '^\[\s*\K[0-9]+')
+          matches_ufw+=("$num|$line")
+        done < <(ufw status numbered 2>/dev/null | grep "$target")
+      fi
+
+      # 2. 搜 IPTables (IPv4)
+      while read -r line; do
+        matches_ipt+=("$line")
+      done < <(iptables -S INPUT 2>/dev/null | grep -w "$target")
+
+      # 3. 搜 IP6Tables (IPv6) - [新增]
+      if command -v ip6tables >/dev/null; then
+        while read -r line; do
+          matches_ip6t+=("$line")
+        done < <(ip6tables -S INPUT 2>/dev/null | grep -w "$target")
+      fi
+
+      local count_ufw=${#matches_ufw[@]}
+      local count_ipt=${#matches_ipt[@]}
+      local count_ip6t=${#matches_ip6t[@]}
+      local total=$((count_ufw + count_ipt + count_ip6t))
+
+      # 情境 1: 沒找到
+      if (( total == 0 )); then
+        echo -e "${RED}IP $target 未找到相關規則。${RESET}"
+        continue
+      fi
+
+      # 情境 2: 只有 1 條 -> 秒刪
+      if (( total == 1 )); then
+        if (( count_ufw == 1 )); then
+          IFS='|' read -r num text <<< "${matches_ufw[0]}"
+          echo "y" | ufw delete "$num" >/dev/null 2>&1
+        elif (( count_ipt == 1 )); then
+          local rule="${matches_ipt[0]}"
+          iptables ${rule/-A /-D } >/dev/null 2>&1
+        elif (( count_ip6t == 1 )); then
+          local rule="${matches_ip6t[0]}"
+          ip6tables ${rule/-A /-D } >/dev/null 2>&1
+        fi
+        echo -e "${GREEN}已刪除規則${RESET}"
+        continue 
+      fi
+
+      # 情境 3: 多條規則 -> 顯示選單
+      echo -e "\033[1;33mIP $target 綁定多條規則，請選擇：\033[0m"
+      display_list=()
+      local idx=0
+            
+      # 顯示 UFW
+      for item in "${matches_ufw[@]}"; do
+        IFS='|' read -r num text <<< "$item"
+        echo " $((idx+1))) [UFW] $text"
+        display_list[$idx]="UFW|$num"
+        ((idx++))
+      done
+      # 顯示 IPv4
+      for item in "${matches_ipt[@]}"; do
+        echo " $((idx+1))) [IPv4] $item"
+        display_list[$idx]="IPT|$item"
+        ((idx++))
+      done
+      # 顯示 IPv6
+      for item in "${matches_ip6t[@]}"; do
+        echo " $((idx+1))) [IPv6] $item"
+        display_list[$idx]="IP6T|$item"
+        ((idx++))
+      done
+      echo " $((idx+1))) 全部刪除 (ALL)"
+
+      read -p "請選擇編號 (多選用空格): " choices
+            
+      # 處理 ALL
+      if [[ "$choices" =~ $((idx+1)) ]]; then
+        # 刪 IPT
+        for rule in "${matches_ipt[@]}"; do iptables ${rule/-A /-D } >/dev/null 2>&1; done
+        # 刪 IP6T
+        for rule in "${matches_ip6t[@]}"; do ip6tables ${rule/-A /-D } >/dev/null 2>&1; done
+        # 刪 UFW (倒序)
+        if (( ${#matches_ufw[@]} > 0 )); then
+          for (( i=${#matches_ufw[@]}-1; i>=0; i-- )); do
+            IFS='|' read -r num text <<< "${matches_ufw[$i]}"
+            echo "y" | ufw delete "$num" >/dev/null 2>&1
+          done
+        fi
+        echo -e "\033[1;32m已全部刪除 $target 相關規則。\033[0m"
+        continue
+      fi
+
+      # 處理多選
+      local ufw_dels=()
+      for c in $choices; do
+        local arr_idx=$((c-1))
+        [[ -z "${display_list[$arr_idx]}" ]] && continue
+        local val="${display_list[$arr_idx]#*|}"
+        local type="${display_list[$arr_idx]%%|*}"
+
+        if [[ "$type" == "IPT" ]]; then
+          iptables ${val/-A /-D } >/dev/null 2>&1
+        elif [[ "$type" == "IP6T" ]]; then
+          ip6tables ${val/-A /-D } >/dev/null 2>&1
+        elif [[ "$type" == "UFW" ]]; then
+          ufw_dels+=("$val")
         fi
       done
-      if [[ $valid == true ]]; then
-        del_port "$proto" "${ports[@]}"
-        save_rules
+      # 執行 UFW 刪除 (倒序)
+      if (( ${#ufw_dels[@]} > 0 )); then
+        IFS=$'\n' sorted=($(sort -rn <<<"${ufw_dels[*]}"))
+        unset IFS
+        for n in "${sorted[@]}"; do echo "y" | ufw delete "$n" >/dev/null 2>&1; done
+        echo -e "${GREEN}規則刪除完成。${RESET}"
       fi
-      read -p "按任意鍵繼續..." -n1
-      ;;
-    3)
-      # 請用戶輸入 IP 和端口
-      read -p "請輸入要刪除的端口: " port
-      read -p "請輸入協議類型(tcp/udp，默認tcp): " proto
-      check_port "$port" "$proto"
-      result=$?
-      if [[ $result -eq 0 ]]; then
-        read -p "請輸入要刪除的 IP 地址: " ip
-        local proto=${proto:-tcp}
-        if [ $fw = ufw ]; then
-          ufw delete allow from $ip to any port $port proto $proto
-          return
-        fi
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-          # IPv4 處理
-          echo "檢測到 IPv4 地址，將刪除該地址的端口..."
-          iptables -D INPUT -p "$proto" -s $ip --dport $port -j ACCEPT
-          iptables -D INPUT -p "$proto" -s $ip --dport $port -j DROP
-          echo "IPv4 端口 $port 已刪除給 $ip 協議為 $proto"
-        
-          save_rules
-        elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-          proto=${proto:-tcp}
-        # IPv6 處理
-          echo "檢測到 IPv6 地址，將刪除該地址的端口..."
-          ip6tables -D INPUT -p $proto -s $ip --dport $port -j ACCEPT
-          ip6tables -D INPUT -p $proto -s $ip --dport $port -j DROP
-          echo "IPv6 端口 $port 已刪除給 $ip 協議為 $proto"
-          save_rules
-        else
-          echo "無效的 IP 地址"
+
+    else 
+      local deleted_count=0
+      
+      # 1. 清理 IPv4 iptables
+      while read -r rule; do
+        local del_cmd="${rule/-A /-D }"
+        iptables $del_cmd >/dev/null 2>&1
+        ((deleted_count++))
+      done < <(iptables -S INPUT 2>/dev/null | grep -E "(:|--dport | --sport )$target( |$)")
+      
+      if command -v ip6tables >/dev/null; then
+          while read -r rule; do
+            local del_cmd="${rule/-A /-D }"
+            ip6tables $del_cmd >/dev/null 2>&1
+            ((deleted_count++))
+          done < <(ip6tables -S INPUT 2>/dev/null | grep -E "(:|--dport | --sport )$target( |$)")
+      fi
+
+      # 3. 清理 UFW
+      if command -v ufw >/dev/null; then
+        local ufw_nums=()
+        while read -r line; do
+          local num=$(echo "$line" | grep -oP '^\[\s*\K[0-9]+')
+          ufw_nums+=("$num")
+        done < <(ufw status numbered 2>/dev/null | grep "$target")
+        if (( ${#ufw_nums[@]} > 0 )); then
+          # 倒序刪除
+          IFS=$'\n' sorted=($(sort -rn <<<"${ufw_nums[*]}"))
+          unset IFS
+          for n in "${sorted[@]}"; do
+            echo "y" | ufw delete "$n" >/dev/null 2>&1
+            ((deleted_count++))
+          done
         fi
       fi
-      ;;
-      4)
-        read -p "請輸入要刪除的 IP 地址（支持單個IP或網段，如 192.168.1.0/24）: " ip
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-          # IPv4 處理
-          read -p "要刪除的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          if [ $fw = ufw ]; then
-            ufw delete allow from "$ip"
-            return
-          fi
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            return 1
-          else
-            iptables -D INPUT -s "$ip" -p "$proto" -j ACCEPT 
-            iptables -D INPUT -s "$ip" -p "$proto" -j DROP
-            save_rules
-          fi
-        elif [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-          # IPv6 處理
-          read -p "要刪除的協議（預設tcp）：" proto
-          local proto=${proto:-tcp}
-          # 檢查協議是否有效
-          if [[ $proto != "tcp" && $proto != "udp" ]]; then
-            echo "無效的協議類型，請使用tcp或udp"
-            break
-          else
-            ip6tables -D INPUT -s "$ip" -p "$proto" -j ACCEPT 
-            ip6tables -D INPUT -s "$ip" -p "$proto" -j DROP
-            save_rules
-          fi
-        else
-          echo "無效的 IP 地址"
-        fi
-        ;;
-    esac
-  
+
+      if (( deleted_count > 0 )); then
+        echo -e "${GREEN}端口 $target 清理完畢，共刪除 $deleted_count 條規則。${RESET}"
+      else
+        echo -e "${RED}端口 $target 無相關規則。${RESET}"
+      fi
+    fi
+  done
+  save_rules
+  sleep 1.5
 }
+
+menu_deny_port() {
+  if [ $fw == ufw ]; then
+    local ufw_policy=$(ufw status verbose 2>/dev/null | awk -F'[ :]*' '/Default:/ {print tolower($2)}')
+    [[ "$ufw_policy" =~ ^(deny|reject)$ ]] && return 0
+  elif [ $fw == iptables ]; then
+    local ipt_policy=$(iptables -S INPUT 2>/dev/null | awk '/^-P INPUT/ {print $3}')
+    [[ "$ipt_policy" =~ ^(DROP|REJECT)$ ]] && return 0
+  fi
+  local input clean_input items item ip port
+  local proto_choice proto
+
+  read -p "輸入 IP 或端口 (可多個，範圍80-82，用逗號/空格): " input
+  [[ -z "$input" ]] && return 0
+
+  clean_input="${input//,/ }"
+  items=()
+
+  for token in $clean_input; do
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local s=${BASH_REMATCH[1]}
+      local e=${BASH_REMATCH[2]}
+      for ((p=s; p<=e; p++)); do items+=("$p"); done
+    else
+        items+=("$token")
+    fi
+  done
+
+  for item in "${items[@]}"; do
+    if [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] || [[ "$item" =~ : ]]; then
+      ip="$item"
+      read -p "開放特定端口? (輸入 0 或直接 Enter 代表全部開放): " port
+            
+      if [[ -z "$port" || "$port" == "0" ]]; then
+        echo -e "\033[1;36m-> 僅放行 IP (All Ports)\033[0m"
+
+        # UFW
+        if [ $fw == ufw ]; then
+          ufw deny from "$ip" >/dev/null
+          echo -e "${GREEN}已阻斷 $ip${RESET}"
+        elif [ $fw == iptables ]; then
+          if [[ "$ip" =~ : ]]; then
+            # IPv6
+            ip6tables -A INPUT -s "$ip" -j DROP
+            echo -e "${GREEN}已阻斷 $ip${RESET}"
+          else
+            # IPv4
+            iptables -A INPUT -s "$ip" -j DROP
+            echo -e "${GREEN}已阻斷 $ip${RESET}"
+          fi
+        fi
+        continue
+      fi
+      printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
+      read -p "請選擇協議: " proto_choice
+      case "$proto_choice" in
+      2) proto="udp" ;;
+      3) proto="all" ;;
+      *) proto="tcp" ;;
+      esac
+
+      # UFW
+      if [ $fw == ufw ]; then
+        if [[ "$proto" == "all" ]]; then
+          ufw deny from "$ip" to any port "$port" proto tcp >/dev/null
+          ufw deny from "$ip" to any port "$port" proto udp >/dev/null
+        else
+          ufw deny from "$ip" to any port "$port" proto "$proto" >/dev/null
+        fi
+        echo -e "${GREEN}規則已添加${RESET}"
+      elif [ $fw == iptables ]; then
+        if [[ "$ip" =~ : ]]; then
+          # IPv6
+          if [[ "$proto" == "all" ]]; then
+            ip6tables -A INPUT -s "$ip" -p tcp --dport "$port" -j DROP
+            ip6tables -A INPUT -s "$ip" -p udp --dport "$port" -j DROP
+          else
+            ip6tables -A INPUT -s "$ip" -p $proto --dport "$port" -j DROP
+          fi
+        else
+          if [[ "$proto" == "all" ]]; then
+            iptables -A INPUT -s "$ip" -p tcp --dport "$port" -j DROP
+            iptables -A INPUT -s "$ip" -p udp --dport "$port" -j DROP
+          else
+            iptables -A INPUT -s "$ip" -p $proto --dport "$port" -j DROP
+          fi
+        fi
+        echo -e "${GREEN}規則已添加${RESET}"
+      fi
+      continue
+    fi
+    port="$item"
+    printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
+    read -p "請選擇協議: " proto_choice
+    case "$proto_choice" in
+    2) proto="udp" ;;
+    3) proto="all" ;;
+    *) proto="tcp" ;;
+    esac
+
+    # UFW
+    if command -v ufw >/dev/null; then
+      if [[ "$proto" == "all" ]]; then
+        ufw allow "$port" >/dev/null # UFW 預設 allow 80 會同時開 tcp/udp
+        echo "${GREEN}端口 $port 已阻斷${RESET}"
+      else
+        ufw allow "$port"/"$proto" >/dev/null
+        echo -e "${GREEN}端口 $port ($proto) 已阻斷${RESET}"
+      fi
+    elif [ $fw == iptables ]; then
+      if [[ "$proto" == "all" ]]; then
+        # TCP
+        iptables  -A INPUT -p tcp --dport "$port" -j DROP
+        ip6tables -A INPUT -p tcp --dport "$port" -j DROP
+        # UDP
+        iptables -A INPUT -p udp --dport "$port" -j DROP
+        ip6tables -A INPUT -p udp --dport "$port" -j DROP
+      else
+        iptables -A INPUT -p "$proto" --dport "$port" -j DROP
+        ip6tables -A INPUT -p "$proto" --dport "$port" -j DROP
+      fi
+      echo -e "${GREEN}端口 $port ($proto) 已阻斷 (IPv4+IPv6)${RESET}"
+    fi
+    continue
+  done
+
+  save_rules
+  echo -e "${GREEN}所有規則處理完畢。${RESET}"
+  sleep 1.5
+}
+
+change_default_policy() {
+  local current=""
+  local opposite=""
+
+  # --- UFW ---
+  if command -v ufw >/dev/null 2>&1; then
+    current=$(ufw status verbose 2>/dev/null | awk -F'[ :]*' '/Default:/ {print tolower($2)}')
+    if [[ -n "$current" ]]; then
+      if [[ "$current" == "deny" || "$current" == "reject" ]]; then
+        opposite="allow"
+      else
+        opposite="deny"
+      fi
+      read -p "目前 UFW 預設為 $current，是否要更改為 $opposite？(y/n): " yn
+      [[ "$yn" =~ ^[Yy]$ ]] || return 0
+      ufw default "$opposite" >/dev/null 2>&1
+      echo -e "${YELLOW}UFW 預設規則已修改為 $opposite${RESET}" 
+      return
+    fi
+  fi
+
+  # --- iptables ---
+  if command -v iptables >/dev/null 2>&1; then
+    current=$(iptables -S INPUT 2>/dev/null | awk '/^-P INPUT/ {print tolower($3)}')
+    if [[ -n "$current" ]]; then
+      if [[ "$current" == "drop" || "$current" == "reject" ]]; then
+        opposite="ACCEPT"
+      else
+        opposite="DROP"
+      fi
+      read -p "目前 iptables 預設為 $current，是否要更改為 $opposite？(y/n): " yn
+      [[ "$yn" =~ ^[Yy]$ ]] || return 0
+      iptables -P INPUT "$opposite" >/dev/null 2>&1
+      echo -e "${YELLOW}iptables 預設規則已修改為 $opposite${RESET}" 
+      return
+    fi
+  fi
+}
+
+
 munu_fw() {
   if [[ $fw == ufw ]]; then
     menu_ufw
@@ -1529,201 +1476,204 @@ munu_fw() {
 }
 
 menu_ufw(){
-    while true; do
-        clear
-        echo -e "${GREEN}UFW基礎防火牆管理${RESET}"
-        echo -e "${BLUE}------------------------${RESET}"
-        ufw status
-        echo ""
-        echo -e "${GREEN}防火牆管理${RESET}"
-        echo -e "${BLUE}------------------------${RESET}"
-        echo -e "${CYAN}1. 開放端口          2. 刪除端口${RESET}"
-        echo ""
-        echo -e "${CYAN}3. 禁止ping             4. 允許ping${RESET}"
-        echo ""
-        echo -e "${CYAN}5. 允許CloudFlare IP      6. 刪除CloudFlare IP${RESET}"
-        echo ""
-        echo -e "${CYAN}7. 阻止Censys IP訪問   8. 刪除阻止Censys IP${RESET}"
-        echo -e "${BLUE}------------------------${RESET}"
-        echo -e "${RED}0. 退出                  00. 更新腳本${RESET}"
-        echo ""
-        echo -n -e "${YELLOW}請選擇操作 [0-8]: ${RESET}"
-        read -r choice
-        case $choice in
-        1) 
-            clear
-            menu_allow_port 
-            ;;
-        2)
-            clear
-            menu_del_port 
-            ;;
-        3)
-            clear
-            block_ping 
-            read -p "操作完成，請按任意鍵..." -n1
-            ;;
-        4)
-            clear
-            allow_ping 
-            read -p "操作完成，請按任意鍵..." -n1
-            ;;
-        5)
-            allow_cf_ip 
-            read -p "操作完成，請按任意鍵..." -n1
-            ;;
-        6)
-            del_cf_ip 
-            read -p "操作完成，請按任意鍵..." -n1
-            ;;
-        7)
-            censys_block add
-            ;;
-        8)
-            censys_block del
-            ;;
-        0)
-            echo "感謝使用防火牆管理工具，再見！"
-            exit 0
-            ;;
-        00)
-            clear
-            echo "更新腳本"
-            echo "------------------------"
-            update_script
-            ;;
-        *)
-            echo "無效選擇，請重試"
-            read -p "按任意鍵繼續..." -n1
-            ;;
-        esac
-    done
+  while true; do
+    clear
+    port=""
+    proto=""
+    ip=""
+    echo -e "${BLUE}------------------------${RESET}"
+    ufw status
+    echo ""
+    echo -e "${GREEN}防火牆管理${RESET}"
+    echo -e "${BLUE}------------------------${RESET}"
+    echo -e "${CYAN}1. 開放端口          2. 刪除端口${RESET}"
+    echo ""
+    echo -e "${CYAN}3. 阻斷端口（給預設規則為ACCEPT的）${RESET}"
+    echo ""
+    echo -e "${CYAN}4. 禁止ping             5. 允許ping${RESET}"
+    echo ""
+    echo -e "${CYAN}6. 允許CloudFlare IP      7. 刪除CloudFlare IP${RESET}"
+    echo ""
+    echo -e "${CYAN}8. 阻止Censys IP訪問   9. 刪除阻止Censys IP${RESET}"
+    echo ""
+    echo -e "${CYAN}10. 更改防火牆預設規則${RESET}"
+    echo -e "${BLUE}------------------------${RESET}"
+    echo -e "${RED}0. 退出                  u. 更新腳本${RESET}"
+    echo ""
+    echo -n -e "${YELLOW}請選擇操作 [0-10 / u]: ${RESET}"
+    read -r choice
+    case $choice in
+    1) 
+      clear
+      menu_allow_port 
+      ;;
+    2)
+      clear
+      menu_del_port 
+      ;;
+    3)
+      clear
+      menu_deny_port
+      ;;
+    4)
+      clear
+      block_ping 
+      read -p "操作完成，請按任意鍵..." -n1
+      ;;
+    5)
+      clear
+      allow_ping 
+      read -p "操作完成，請按任意鍵..." -n1
+      ;;
+    6)
+      allow_cf_ip 
+      read -p "操作完成，請按任意鍵..." -n1
+      ;;
+    7)
+      del_cf_ip 
+      read -p "操作完成，請按任意鍵..." -n1
+      ;;
+    8)
+      censys_block add
+      ;;
+    9)
+      censys_block del
+      ;;
+    10)
+      change_default_policy
+      ;;
+    0)
+      echo "感謝使用防火牆管理工具，再見！"
+      exit 0
+      ;;
+    u)
+      clear
+      update_script
+      ;;
+    *)
+      echo "無效選擇，請重試"
+      sleep 0.5
+      ;;
+    esac
+  done
 }
 
 menu_iptables() {
-    while true; do
-        port=""
-        proto=""
-        ip=""
-        clear
-        echo -e "${GREEN} iptables防火牆管理${RESET}"
-        echo -e "${BLUE}------------------------${RESET}"
-        echo -e "${YELLOW}此顯示防火牆規則為ipv4${RESET}"
-        iptables -L INPUT
-        echo ""
-        echo -e "${GREEN}防火牆管理${RESET}"
-        echo -e "${BLUE}------------------------${RESET}"
-        echo -e "${CYAN}1. 開放端口          2. 刪除端口${RESET}"
-        echo ""
-        echo -e "${CYAN}3. 禁止ping             4. 允許ping${RESET}"
-        echo ""
-        echo -e "${BOLD_CYAN}5. 基礎設置(建議)       6. 關閉外網進入docker內部流量（建議）${RESET}"
-        echo ""
-        echo -e "${CYAN}7. 允許CloudFlare IP      8. 刪除CloudFlare IP${RESET}"
-        echo ""
-        echo -e "${CYAN}9. 阻止Censys IP訪問   10. 刪除阻止Censys IP${RESET}"
-        echo ""
-        echo -e "${CYAN}11. 顯示ipv6防火牆規則    12. 進階功能${RESET}"
-        echo ""
-        echo -e "${BLUE}------------------------${RESET}"
-        echo -e "${RED}0. 退出              00. 更新腳本${RESET}"
-        echo ""
-        echo -n -e "${YELLOW}請選擇操作 [0-12, 00]: ${RESET}"
-        read -r choice
-        case $choice in
-        1)
-          menu_allow_port
-          ;;
-        2)
-          menu_del_port
-          ;;
-        3)
-          clear
-          echo "禁止ping"
-          echo "------------------------"
-          block_ping
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        4)
-          clear
-          echo "允許ping"
-          echo "------------------------"
-          allow_ping iptables
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        5)
-          clear
-          echo "安全基礎設置"
-          echo "------------------------"
-          default_settings
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        6)
-          clear
-          disable_in_docker
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        7)
-          clear
-          allow_cf_ip 
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        8)
-          clear
-          del_cf_ip 
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        9)
-          clear
-          censys_block add
-          ;;
-        10)
-          clear
-          censys_block del
-          ;;
-        11)
-          clear
-          ip6tables -L INPUT
-          read -p "操作完成，按任意鍵繼續..." -n1
-          ;;
-        12)
-          clear
-          menu_advanced
-          ;;
-        0)
-          echo "感謝使用防火牆管理工具，再見！"
-          exit 0
-          ;;
-        00)
-          clear
-          echo "更新腳本"
-          echo "------------------------"
-          update_script
-          ;;
-        *)
-          echo "無效選擇，請重試"
-          read -p "按任意鍵繼續..." -n1
-          ;;
-        esac
-    done
+  while true; do
+    port=""
+    proto=""
+    ip=""
+    clear
+    echo -e "${BLUE}------------------------${RESET}"
+    echo -e "${YELLOW}此顯示防火牆規則為ipv4${RESET}"
+    iptables -L INPUT
+    echo ""
+    echo -e "${GREEN}防火牆管理${RESET}"
+    echo -e "${BLUE}------------------------${RESET}"
+    echo -e "${CYAN}1. 開放端口          2. 刪除端口${RESET}"
+    echo ""
+    echo -e "${CYAN}3. 阻斷端口（給預設規則為ACCEPT的）${RESET}"
+    echo ""
+    echo -e "${CYAN}4. 禁止ping             5. 允許ping${RESET}"
+    echo ""
+    echo -e "${BOLD_CYAN}6. 基礎設置(建議)       7. 關閉外網進入docker內部流量（建議）${RESET}"
+    echo ""
+    echo -e "${CYAN}8. 允許CloudFlare IP      9. 刪除CloudFlare IP${RESET}"
+    echo ""
+    echo -e "${CYAN}10. 阻止Censys IP訪問   11. 刪除阻止Censys IP${RESET}"
+    echo ""
+    echo -e "${CYAN}12. 顯示ipv6防火牆規則    13. 更改防火牆預設規則${RESET}"
+    echo ""
+    echo -e "${BLUE}------------------------${RESET}"
+    echo -e "${RED}0. 退出              u. 更新腳本${RESET}"
+    echo ""
+    echo -n -e "${YELLOW}請選擇操作 [0-13 / u]: ${RESET}"
+    read -r choice
+    case $choice in
+    1)
+      menu_allow_port
+      ;;
+    2)
+      menu_del_port
+      ;;
+    3)
+      menu_deny_port
+      ;;
+    4)
+      block_ping
+      ;;
+    5)
+      allow_ping
+      ;;
+    6)
+      clear
+      default_settings
+      read -p "按任意鍵繼續..." -n1
+      ;;
+    7)
+      clear
+      disable_in_docker
+      ;;
+    8)
+      clear
+      allow_cf_ip 
+      ;;
+    9)
+      clear
+      del_cf_ip 
+      ;;
+    10)
+      clear
+      censys_block add
+      ;;
+    11)
+      clear
+      censys_block del
+      ;;
+    12)
+      clear
+      ip6tables -L INPUT
+      read -p "操作完成，按任意鍵繼續..." -n1
+      ;;
+    13)
+      clear
+      change_default_policy
+      ;;
+    0)
+      echo "感謝使用防火牆管理工具，再見！"
+      exit 0
+      ;;
+    u)
+      clear
+      update_script
+      ;;
+    *)
+      echo -e "${RED}無效選擇，請重試${RESET}"
+      sleep 0.5
+      ;;
+    esac
+  done
 }
 menu_install_fw(){
-    if [ $fw = none ]; then
-        clear
-        echo "1. 安裝UFW(適合純新手,不裝docker)"
-        echo ""
-        echo "2. 安裝iptables(適合比較進階的人,裝docker)"
-        echo "-----------------"
-        read -p "請選擇操作:[1-2]" comfin
-        case $comfin in
-        1)
-          setup_ufw
-          ;;
-        2)
-          setup_iptables
-          ;;    
-        esac
-    fi
+  if [ $fw != none ]; then
+    return 0
+  fi
+  while true; do
+    clear
+    echo "1. 安裝UFW(適合純新手,不裝docker)"
+    echo ""
+    echo "2. 安裝iptables(適合比較進階的人,裝docker)"
+    echo "-----------------"
+    read -p "請選擇操作:[1-2]" comfin
+    case $comfin in
+    1)
+      install_fw ufw
+      ;;
+    2)
+      install_fw iptables 
+      ;;    
+    esac
+  done
 }
 case "$1" in
   --version|-V)
@@ -1743,7 +1693,7 @@ esac
 check_system
 check_app
 check_fw
-[[ ! -z $1 ]] && check_cli_fw
+[[ -z $# ]] && check_cli_fw
 case "$1" in
   open|deny|del)
     act_iptables=ACCEPT
@@ -1784,7 +1734,7 @@ case "$1" in
       fi
     elif [[ $2 == ip_port ]]; then
       [[ -z "$3" || -z "$4" ]] && fw help
-      proto_cli=${5:-tcp}
+      proto_cli=${4:-tcp}
       [[ $proto_cli != "tcp" && $proto_cli != "udp" ]] && echo -e "${RED}無效的協議類型，請使用tcp或udp${RESET}" >&2 && exit 1
       [ $fw == ufw ] && ufw $act1_ufw $act_ufw from "$3" to any port "$4" proto "$proto_cli"
       if [ $fw == iptables ]; then
