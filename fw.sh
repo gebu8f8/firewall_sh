@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="6.0.1"
+version="7.0.0"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -40,48 +40,59 @@ fi
 
 
 allow_port() {
-  local PROTO="$1"  # 第一個參數是協議類型
-  if [ -z "$2" ]; then
+  local PROTO="$1"
+  shift
+  if [ "$#" -eq 0 ]; then
     echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
-    sleep 1
     return 1
   fi
-  
-  if [ -z "$PROTO" ]; then
-    PROTO="tcp"  # 如果協議未提供，默認為TCP
-  fi
-  shift  # 移動參數，剩餘的是端口列表
-  local PORTS=("$@")
-  if [ $fw = ufw ]; then
-    for PORT in "${PORTS[@]}"; do
-      if [ -z "$PORT" ]; then
-        continue  # 跳過空端口
-      fi
-      ufw allow $PORT/$PROTO
-    done
-    return 0
-  fi
-  for PORT in "${PORTS[@]}"; do
-    if [ -z "$PORT" ]; then
-      continue  # 跳過空端口
+    
+  [ -z "$PROTO" ] && PROTO="tcp"  
+  if [ $fw = ufw ]; then  
+    for PORT in "$@"; do
+      if [ -z "$PORT" ]; then  
+        continue
+      fi  
+      ufw allow $PORT/$PROTO  
+    done  
+    return 0  
+  fi  
+
+  for PORT in "$@"; do
+    [ -z "$PORT" ] && continue
+
+    local TARGET_CHAIN="INPUT"
+    local IPT_ARGS="--dport"
+    
+    if ss -tulnp | grep -E "[:.]$PORT\\b" | grep -qi docker; then
+      TARGET_CHAIN="DOCKER-USER"
+      IPT_ARGS="-m conntrack --ctorigdstport"
     fi
-    # ipv4
-    if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      if iptables -A INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-        echo -e "${GREEN}IPv4 $PROTO 端口 $PORT 已開啟${RESET}" >&2
+    # IPv4
+    if iptables -C $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
+      iptables -D $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null
+    fi
+    if ! iptables -C "$TARGET_CHAIN" -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null; then
+      if iptables -I "$TARGET_CHAIN" 1 -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT; then
+        echo -e "${GREEN}IPv4 $PROTO $PORT → $TARGET_CHAIN 已放行${RESET}" >&2
       else
-        echo -e "${RED}錯誤：無法開啟 IPv4 $PROTO 端口 $PORT${RESET}" >&2
+        echo -e "${RED}IPv4 $PROTO $PORT 放行失敗${RESET}" >&2
       fi
     fi
-    # ipv6
-    if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      if ip6tables -A INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-        echo -e "${GREEN}IPv6 $PROTO 端口 $PORT 已開啟${RESET}" >&2
+
+    # IPv6
+    if ip6tables -C $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
+      ip6tables -D $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null
+    fi
+    if ! ip6tables -C "$TARGET_CHAIN" -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null; then
+      if ip6tables -I "$TARGET_CHAIN" 1 -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT; then
+        echo -e "${GREEN}IPv6 $PROTO $PORT → $TARGET_CHAIN 已放行${RESET}" >&2
       else
-        echo -e "${RED}錯誤：無法開啟 IPv6 $PROTO 端口 $PORT${RESET}" >&2
+        echo -e "${RED}IPv6 $PROTO $PORT 放行失敗${RESET}" >&2
       fi
     fi
   done
+
   return 0
 }
 allow_ping() {
@@ -97,10 +108,14 @@ allow_ping() {
   if iptables -C INPUT -p icmp --icmp-type echo-request -j DROP >/dev/null; then
     iptables -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null
     iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+  else
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
   fi
   # IPv6
   if ip6tables -C INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP >/dev/null; then
     ip6tables -D INPUT -p ipv6-icmp --icmpv6-type 128 -j DROP 2>/dev/null
+    ip6tables -A INPUT -p ipv6-icmp --icmpv6-type 128 -j ACCEPT
+  else
     ip6tables -A INPUT -p ipv6-icmp --icmpv6-type 128 -j ACCEPT
   fi
   echo -e "${GREEN}ICMP 已開啟${RESET}" >&2
@@ -121,12 +136,18 @@ block_ping() {
   if iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT >/dev/null; then
     iptables -D INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
     iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+  else
+    iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
   fi
+  
+  
 
   # IPv6
   if ip6tables -C INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT >/dev/null; then
     ip6tables -D INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j ACCEPT 2>/dev/null
     ip6tables -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 128 -j DROP
+  else
+    ip6tables -A INPUT -p icmp --icmp-type echo-request -j DROP
   fi
   echo -e "${GREEN}ICMP 已封鎖${RESET}" >&2
   save_rules
@@ -622,7 +643,6 @@ EOF
   check_docker
 }
 disable_in_docker(){
-  local daemon="/etc/docker/daemon.json"
   local EXTERNAL_INTERFACE=""
   if ! command -v docker &>/dev/null; then
     echo -e "${RED}未安裝docker，請先安裝${RESET}"
@@ -648,214 +668,147 @@ disable_in_docker(){
     sleep 1
     return 1
   fi
-  
-  iptables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
-  echo "關閉外網(IPv4)進入docker內部流量。"
+  if ! iptables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
+    iptables -A DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP
+    echo -e "${GREEN}關閉外網(IPv4)進入docker內部流量${RESET}。"
+  fi
   if [ -f "$daemon" ] && grep -q '"ipv6": true' "$daemon"; then
     local ipv6=true
   fi
   if [[ "$ipv6" == "true" ]]; then
-    ip6tables -I DOCKER -i "$EXTERNAL_INTERFACE" -j DROP
-    echo "已關閉外網(IPv6)進入docker內部流量。"
+    if ! ip6tables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
+      ip6tables -A DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP
+      echo -e "${GREEN}已關閉外網(IPv6)進入docker內部流量。${RESET}"
+    fi
   fi
-
-  # 確保 docker 設定檔目錄與檔案存在
-  mkdir -p /etc/docker
-  touch $daemon
-  [ ! -s "$daemon" ] && echo '{}' > "$daemon"
-      
-  # 檢查並確保 daemon.json 是有效的 JSON
-  if ! jq empty "$daemon" &>/dev/null; then
-    echo '{}' > "$daemon"
-  fi
-      
-  # 檢查並設定 "iptables": false
-  if jq -e '.iptables == false' "$daemon" &>/dev/null; then
-    open_docker_fw_service $ipv6
-  else
-    cp "$daemon" "$daemon.bak"
-    local tmp=$(mktemp)
-    jq '. + {"iptables": false}' "$daemon" > "$tmp" && mv "$tmp" "$daemon"
-    # 重啟 Docker 服務
-    service docker restart
-    open_docker_fw_service $ipv6
-    save_rules
-  fi
+  save_rules
 }
 
 del_port() {
-  local PROTO="$1"  # 第一個參數是協議類型
-  if [ -z "$2" ]; then
+  local PROTO="$1"
+  shift
+
+  [ -z "$PROTO" ] && PROTO="tcp"
+
+  if [ "$#" -eq 0 ]; then
     echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
     return 1
   fi
-  
-  if [ -z "$PROTO" ]; then
-    PROTO="tcp"  # 如果協議未提供，默認為TCP
-  fi
-  shift  # 移動參數，剩餘的是端口列表
-  local PORTS=("$@")
 
-  if [ $fw = ufw ]; then
-    for PORT in "${PORTS[@]}"; do
-      if [ -z "$PORT" ]; then
-        continue  # 跳過空端口
-      fi
-      ufw delete allow $PORT/$PROTO 2>/dev/null
-      ufw delete allow $PORT 2>/dev/null
+  if [ "$fw" = "ufw" ]; then
+    for PORT in "$@"; do
+      [ -z "$PORT" ] && continue
+      ufw delete allow "$PORT/$PROTO" 2>/dev/null
+      ufw delete allow "$PORT" 2>/dev/null
     done
     return 0
   fi
-  for PORT in "${PORTS[@]}"; do
-    if [ -z "$PORT" ]; then
-      continue  # 跳過空端口
+
+  for PORT in "$@"; do
+    [ -z "$PORT" ] && continue
+    
+    local TARGET_CHAIN="INPUT"
+    # 自動偵測：是否屬於 Docker 容器
+    if ss -tulnp | grep -E "[:.]$PORT\\b" | grep -qi docker; then
+      TARGET_CHAIN="DOCKER-USER"
     fi
+
     local DEL_SUCCESS=0
-    if iptables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      echo -e "${GREEN}已刪除 IPv4 $PROTO 端口 $PORT 的允許規則 (ACCEPT)${RESET}" >&2
-      DEL_SUCCESS=1
+    
+    local ARGS_NORMAL="--dport $PORT"
+    local ARGS_CONNTRACK="-m conntrack --ctorigdstport $PORT"
+    local ARGS_LIST=("$ARGS_NORMAL")
+
+    if [ "$TARGET_CHAIN" = "DOCKER-USER" ]; then
+      ARGS_LIST=("$ARGS_CONNTRACK" "$ARGS_NORMAL")
     fi
 
-    if iptables -D INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      echo -e "${GREEN}已刪除 IPv4 $PROTO 端口 $PORT 的阻止規則 (DROP)${RESET}" >&2
-      DEL_SUCCESS=1
-    fi
+    for MATCH_ARG in "${ARGS_LIST[@]}"; do
+        # 刪除 ACCEPT 規則
+        if iptables -D "$TARGET_CHAIN" -p "$PROTO" $MATCH_ARG -j ACCEPT 2>/dev/null; then
+          echo -e "${GREEN}已刪除 IPv4 $PROTO $PORT ($MATCH_ARG) → $TARGET_CHAIN (ACCEPT)${RESET}" >&2
+          DEL_SUCCESS=1
+        fi
+        
+        # 刪除 DROP 規則 (如果有的話)
+        if iptables -D "$TARGET_CHAIN" -p "$PROTO" $MATCH_ARG -j DROP 2>/dev/null; then
+          echo -e "${GREEN}已刪除 IPv4 $PROTO $PORT ($MATCH_ARG) → $TARGET_CHAIN (DROP)${RESET}" >&2
+          DEL_SUCCESS=1
+        fi
+    done
 
-    if [[ $DEL_SUCCESS -eq 0 ]]; then
-      echo -e "${RED}錯誤：IPv4 $PROTO 端口 $PORT 無可刪除的規則${RESET}" >&2
+    # === 開始循環刪除 (IPv6) ===
+    for MATCH_ARG in "${ARGS_LIST[@]}"; do
+        # 刪除 ACCEPT
+        if ip6tables -D "$TARGET_CHAIN" -p "$PROTO" $MATCH_ARG -j ACCEPT 2>/dev/null; then
+          echo -e "${GREEN}已刪除 IPv6 $PROTO $PORT ($MATCH_ARG) → $TARGET_CHAIN (ACCEPT)${RESET}" >&2
+          DEL_SUCCESS=1
+        fi
+        # 刪除 DROP
+        if ip6tables -D "$TARGET_CHAIN" -p "$PROTO" $MATCH_ARG -j DROP 2>/dev/null; then
+          echo -e "${GREEN}已刪除 IPv6 $PROTO $PORT ($MATCH_ARG) → $TARGET_CHAIN (DROP)${RESET}" >&2
+          DEL_SUCCESS=1
+        fi
+    done
+
+    if [ "$DEL_SUCCESS" -eq 0 ]; then
+      echo -e "${RED}未找到可刪除規則：$PROTO $PORT ($TARGET_CHAIN)${RESET}" >&2
     fi
   done
+
   save_rules
   return 0
 }
 deny_port() {
-  local PROTO="$1"  # 第一個參數是協議類型
-  if [ -z "$2" ]; then
+  local PROTO="$1"
+  shift
+  if [ "$#" -eq 0 ]; then
     echo -e "${RED}錯誤：未指定端口號${RESET}" >&2
     return 1
   fi
   
-  if [ -z "$PROTO" ]; then
-    PROTO="tcp"  # 如果協議未提供，默認為TCP
-  fi
-  shift  # 移動參數，剩餘的是端口列表
-  local PORTS=("$@")
+  [ -z "$PROTO" ] && PROTO="tcp"
   
-  for PORT in "${PORTS[@]}"; do
+
+  for PORT in "$@"; do
     if [ -z "$PORT" ]; then
       continue  # 跳過空端口
     fi
+    local TARGET_CHAIN="INPUT"
+    local TARGET_ADD="-A"
+    local IPT_ARGS="--dport"
+    if ss -tulnp | grep -E "[:.]$PORT\\b" | grep -qi docker; then
+      TARGET_CHAIN="DOCKER-USER"
+      TARGET_ADD="-I"
+      IPT_ARGS="-m conntrack --ctorigdstport"
+    fi
     # ipv4
-    if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      if iptables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
+    if iptables -C $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null; then
+      iptables -D $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null
+    fi
+    
+    if ! iptables -C $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
+      if iptables $TARGET_ADD $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
         echo -e "${GREEN}IPv4 $PROTO 端口 $PORT 已阻止${RESET}" >&2
       else
         echo -e "${RED}錯誤：無法阻止 IPv4 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
-    # 檢查是否允許之
-    # IPv4
-    if iptables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      iptables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null
-    fi
-
-    # 確認 DROP 是否已存在，避免重複插入
-    if ! iptables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      iptables -I INPUT -p "$PROTO" --dport "$PORT" -j DROP
-      echo -e "${GREEN}已新增阻止 IPv4 $PROTO 端口 $PORT 的規則 (DROP)${RESET}" >&2
-    fi 
     # ipv6
-    if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      if ip6tables -A INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
+    if ip6tables -C $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null; then
+      ip6tables -D $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j ACCEPT 2>/dev/null
+    fi
+    if ! ip6tables -C $TARGET_CHAIN -p "$PROTO" -$IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
+      if ip6tables $TARGET_ADD $TARGET_CHAIN -p "$PROTO" $IPT_ARGS "$PORT" -j DROP 2>/dev/null; then
         echo -e ${GREEN}"IPv6 $PROTO 端口 $PORT 已阻止${RESET}" >&2
       else
         echo -e "${RED}錯誤：無法阻止 IPv6 $PROTO 端口 $PORT${RESET}" >&2
       fi
     fi
-    # 檢查是否允許之
-    # IPv6
-    if ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null; then
-      ip6tables -D INPUT -p "$PROTO" --dport "$PORT" -j ACCEPT 2>/dev/null
-    fi
-
-    # 確認 DROP 是否已存在，避免重複插入
-    if ! ip6tables -C INPUT -p "$PROTO" --dport "$PORT" -j DROP 2>/dev/null; then
-      ip6tables -I INPUT -p "$PROTO" --dport "$PORT" -j DROP
-      echo -e "${GREEN}已新增阻止 IPv6 $PROTO 端口 $PORT 的規則 (DROP)${RESET}" >&2
-    fi 
   done
-  
   save_rules
   return 0
 }
-
-open_docker_fw_service() {
-    local ipv6="${1:-false}"
-    # 預先定義好服務要執行的最終指令
-    local service_command="/etc/fw/docker.sh"
-
-    mkdir -p /etc/fw/
-    
-    # 修正：下載 v4 腳本到正確的檔名
-    wget -O /etc/fw/docker.sh https://gitlab.com/gebu8f/sh/-/raw/main/firewall/docker.sh
-    chmod +x /etc/fw/docker.sh
-
-    if [ "$ipv6" == "true" ]; then
-      echo "IPv6 模式啟用，下載對應腳本並準備複合指令..."
-      # 下載 v6 腳本
-      wget -O /etc/fw/docker-v6.sh https://gitlab.com/gebu8f/sh/-/raw/main/firewall/docker-v6.sh
-      chmod +x /etc/fw/docker-v6.sh
-      
-      # 【核心修改】使用 sh -c 來安全地執行兩個腳本
-      # 這確保了無論是 systemd 還是 openrc 都能正確處理
-      service_command="/bin/bash -c '/etc/fw/docker.sh & /etc/fw/docker-v6.sh &'"
-    fi
-
-    case $system in
-    1|2)
-      cat > /etc/systemd/system/docker-firewall.service << EOF
-[Unit]
-Description=Docker Firewall Auto-Guard Service
-After=network.target docker.service
-
-[Service]
-ExecStart=${service_command}
-Restart=always
-RestartSec=5
-StandardOutput=null
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      systemctl daemon-reload
-      systemctl enable --now docker-firewall
-      ;;
-    3)
-      # 【優化】移除 sed 手動注入 PID 的操作，完全交給 OpenRC 管理，這樣更穩定可靠。
-      # sed -i '/check_system/a echo $$ > /run/docker-firewall.pid' /etc/fw/docker.sh
-      cat > /etc/init.d/docker-firewall << EOF
-#!/sbin/openrc-run
-
-name="docker-firewall"
-# 使用我們動態構建的指令
-command="${service_command}"
-command_background="yes"
-pidfile="/run/${name}.pid"
-
-depend() {
-    need net docker
-}
-EOF
-      chmod +x /etc/init.d/docker-firewall
-      rc-update add docker-firewall default
-      rc-service docker-firewall start
-      ;;
-    esac
-    echo "Docker 防火牆服務已設定並啟動。"
-}
-
-
 
 install_fw() {
   local type="$1"
@@ -1026,6 +979,14 @@ menu_allow_port() {
         fi
         continue
       fi
+      local TARGET_CHAIN="INPUT"
+      local TARGET_ADD="-A"
+      local IPT_ARGS="--dport"
+      if ss -tulnp | grep -E "[:.]$port\\b" | grep -qi docker; then
+        TARGET_CHAIN="DOCKER-USER"
+        TARGET_ADD="-I"
+        IPT_ARGS="-m conntrack --ctorigdstport"
+      fi
       printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
       read -p "請選擇協議: " proto_choice
       case "$proto_choice" in
@@ -1047,17 +1008,17 @@ menu_allow_port() {
         if [[ "$ip" =~ : ]]; then
           # IPv6
           if [[ "$proto" == "all" ]]; then
-            ip6tables -A INPUT -s "$ip" -p tcp --dport "$port" -j ACCEPT
-            ip6tables -A INPUT -s "$ip" -p udp --dport "$port" -j ACCEPT
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p tcp $IPT_ARGS "$port" -j ACCEPT
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p udp $IPT_ARGS "$port" -j ACCEPT
           else
-            ip6tables -A INPUT -s "$ip" -p $proto --dport "$port" -j ACCEPT
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p $proto $IPT_ARGS "$port" -j ACCEPT
           fi
         else
           if [[ "$proto" == "all" ]]; then
-            iptables -A INPUT -s "$ip" -p tcp --dport "$port" -j ACCEPT
-            iptables -A INPUT -s "$ip" -p udp --dport "$port" -j ACCEPT
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p tcp $IPT_ARGS "$port" -j ACCEPT
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p udp $IPT_ARGS "$port" -j ACCEPT
           else
-            iptables -A INPUT -s "$ip" -p $proto --dport "$port" -j ACCEPT
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p $proto $IPT_ARGS "$port" -j ACCEPT
           fi
         fi
         echo -e "${GREEN}規則已添加${RESET}"
@@ -1065,6 +1026,14 @@ menu_allow_port() {
       continue
     fi
     port="$item"
+    local TARGET_CHAIN="INPUT"
+    local TARGET_ADD="-A"
+    local IPT_ARGS="--dport"
+    if ss -tulnp | grep -E "[:.]$port\\b" | grep -qi docker; then
+      TARGET_CHAIN="DOCKER-USER"
+      TARGET_ADD="-I"
+      IPT_ARGS="-m conntrack --ctorigdstport"
+    fi
     printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
     read -p "請選擇協議: " proto_choice
     case "$proto_choice" in
@@ -1085,14 +1054,15 @@ menu_allow_port() {
     elif [ $fw == iptables ]; then
       if [[ "$proto" == "all" ]]; then
         # TCP
-        iptables  -A INPUT -p tcp --dport "$port" -j ACCEPT
-        ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables $TARGET_ADD $
+        $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j ACCEPT
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j ACCEPT
         # UDP
-        iptables  -A INPUT -p udp --dport "$port" -j ACCEPT
-        ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT
+        iptables $TARGET_ADD $TARGET_CHAIN -p udp $IPT_ARGS "$port" -j ACCEPT
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p udp --dport "$port" -j ACCEPT
       else
-        iptables  -A INPUT -p "$proto" --dport "$port" -j ACCEPT
-        ip6tables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+        iptables $TARGET_ADD $TARGET_CHAIN -p "$proto" $IPT_ARGS "$port" -j ACCEPT
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p "$proto" $IPT_ARGS "$port" -j ACCEPT
       fi
       echo -e "${GREEN}端口 $port ($proto) 已開放 (IPv4+IPv6)${RESET}"
     fi
@@ -1145,13 +1115,13 @@ menu_del_port() {
       # 2. 搜 IPTables (IPv4)
       while read -r line; do
         matches_ipt+=("$line")
-      done < <(iptables -S INPUT 2>/dev/null | grep -w "$target")
+      done < <({ iptables -S INPUT; iptables -S DOCKER-USER; } 2>/dev/null | grep -w "$target")
 
       # 3. 搜 IP6Tables (IPv6) - [新增]
       if command -v ip6tables >/dev/null; then
         while read -r line; do
           matches_ip6t+=("$line")
-        done < <(ip6tables -S INPUT 2>/dev/null | grep -w "$target")
+        done < <({ ip6tables -S INPUT; ip6tables -S DOCKER-USER; } 2>/dev/null | grep -w "$target")
       fi
 
       local count_ufw=${#matches_ufw[@]}
@@ -1258,14 +1228,14 @@ menu_del_port() {
         local del_cmd="${rule/-A /-D }"
         iptables $del_cmd >/dev/null 2>&1
         ((deleted_count++))
-      done < <(iptables -S INPUT 2>/dev/null | grep -E "(:|--dport | --sport )$target( |$)")
+      done < <({ iptables -S INPUT; iptables -S DOCKER-USER; } 2>/dev/null | grep -w "$target")
       
       if command -v ip6tables >/dev/null; then
           while read -r rule; do
             local del_cmd="${rule/-A /-D }"
             ip6tables $del_cmd >/dev/null 2>&1
             ((deleted_count++))
-          done < <(ip6tables -S INPUT 2>/dev/null | grep -E "(:|--dport | --sport )$target( |$)")
+          done < <({ ip6tables -S INPUT; ip6tables -S DOCKER-USER; } 2>/dev/null | grep -w "$target")
       fi
 
       # 3. 清理 UFW
@@ -1349,6 +1319,14 @@ menu_deny_port() {
         fi
         continue
       fi
+      local TARGET_CHAIN="INPUT"
+      local TARGET_ADD="-A"
+      local IPT_ARGS="--dport"
+      if ss -tulnp | grep -E "[:.]$port\\b" | grep -qi docker; then
+        TARGET_CHAIN="DOCKER-USER"
+        TARGET_ADD="-I"
+        IPT_ARGS="-m conntrack --ctorigdstport"
+      fi
       printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
       read -p "請選擇協議: " proto_choice
       case "$proto_choice" in
@@ -1370,17 +1348,17 @@ menu_deny_port() {
         if [[ "$ip" =~ : ]]; then
           # IPv6
           if [[ "$proto" == "all" ]]; then
-            ip6tables -A INPUT -s "$ip" -p tcp --dport "$port" -j DROP
-            ip6tables -A INPUT -s "$ip" -p udp --dport "$port" -j DROP
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p tcp $IPT_ARGS "$port" -j DROP
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p udp $IPT_ARGS "$port" -j DROP
           else
-            ip6tables -A INPUT -s "$ip" -p $proto --dport "$port" -j DROP
+            ip6tables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p $proto $IPT_ARGS "$port" -j DROP
           fi
         else
           if [[ "$proto" == "all" ]]; then
-            iptables -A INPUT -s "$ip" -p tcp --dport "$port" -j DROP
-            iptables -A INPUT -s "$ip" -p udp --dport "$port" -j DROP
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p tcp $IPT_ARGS "$port" -j DROP
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p udp $IPT_ARGS "$port" -j DROP
           else
-            iptables -A INPUT -s "$ip" -p $proto --dport "$port" -j DROP
+            iptables $TARGET_ADD $TARGET_CHAIN -s "$ip" -p $proto $IPT_ARGS "$port" -j DROP
           fi
         fi
         echo -e "${GREEN}規則已添加${RESET}"
@@ -1388,6 +1366,14 @@ menu_deny_port() {
       continue
     fi
     port="$item"
+    local TARGET_CHAIN="INPUT"
+    local TARGET_ADD="-A"
+    local IPT_ARGS="--dport"
+    if ss -tulnp | grep -E "[:.]$port\\b" | grep -qi docker; then
+      TARGET_CHAIN="DOCKER-USER"
+      TARGET_ADD="-I"
+      IPT_ARGS="-m conntrack --ctorigdstport"
+    fi
     printf "1) TCP [預設]\n2) UDP\n3) ALL\n"
     read -p "請選擇協議: " proto_choice
     case "$proto_choice" in
@@ -1408,14 +1394,14 @@ menu_deny_port() {
     elif [ $fw == iptables ]; then
       if [[ "$proto" == "all" ]]; then
         # TCP
-        iptables  -A INPUT -p tcp --dport "$port" -j DROP
-        ip6tables -A INPUT -p tcp --dport "$port" -j DROP
+        iptables $TARGET_ADD $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j DROP
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j DROP
         # UDP
-        iptables -A INPUT -p udp --dport "$port" -j DROP
-        ip6tables -A INPUT -p udp --dport "$port" -j DROP
+        iptables $TARGET_ADD $TARGET_CHAIN -p udp $IPT_ARGS "$port" -j DROP
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p udp $IPT_ARGS "$port" -j DROP
       else
-        iptables -A INPUT -p "$proto" --dport "$port" -j DROP
-        ip6tables -A INPUT -p "$proto" --dport "$port" -j DROP
+        iptables $TARGET_ADD $TARGET_CHAIN -p "$proto" $IPT_ARGS "$port" -j DROP
+        ip6tables $TARGET_ADD $TARGET_CHAIN -p "$proto" $IPT_ARGS "$port" -j DROP
       fi
       echo -e "${GREEN}端口 $port ($proto) 已阻斷 (IPv4+IPv6)${RESET}"
     fi
