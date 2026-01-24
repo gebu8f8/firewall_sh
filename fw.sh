@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.0.0"
+version="7.0.1"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -668,6 +668,9 @@ disable_in_docker(){
     sleep 1
     return 1
   fi
+  if ! iptables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    iptables -A DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  fi
   if ! iptables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
     iptables -A DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP
     echo -e "${GREEN}關閉外網(IPv4)進入docker內部流量${RESET}。"
@@ -676,6 +679,9 @@ disable_in_docker(){
     local ipv6=true
   fi
   if [[ "$ipv6" == "true" ]]; then
+    if ! ip6tables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      ip6tables -A DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    fi
     if ! ip6tables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
       ip6tables -A DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP
       echo -e "${GREEN}已關閉外網(IPv6)進入docker內部流量。${RESET}"
