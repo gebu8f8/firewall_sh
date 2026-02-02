@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.0.1"
+version="7.0.2"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -532,8 +532,7 @@ default_settings(){
 :FORWARD DROP [0:0]
 :OUTPUT ACCEPT [0:0]
 
--A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
--A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 -A INPUT -p tcp --dport <port> -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A FORWARD -i lo -j ACCEPT
@@ -550,14 +549,11 @@ EOF
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 2 -j ACCEPT
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 3 -j ACCEPT
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 4 -j ACCEPT
--A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 133 -j ACCEPT
--A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 134 -j ACCEPT
--A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 135 -j ACCEPT
--A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -j ACCEPT
-
-# 保留連線與本機 loopback
--A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
--A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 133 -s fe80::/10 -j ACCEPT
+-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 134 -s fe80::/10 -j ACCEPT
+-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT
+-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 -A INPUT -p tcp --dport <port> -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A FORWARD -i lo -j ACCEPT
@@ -594,8 +590,7 @@ EOF
     iptables -A INPUT -p tcp --dport $ssh_port -j ACCEPT
     iptables -A INPUT -i lo -j ACCEPT
     iptables -A FORWARD -i lo -j ACCEPT
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 
-    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -P INPUT DROP
     iptables -P FORWARD DROP
     #ipv6
@@ -622,8 +617,7 @@ EOF
     ip6tables -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -j ACCEPT
 
     # 已建立/相關連線
-    ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     # 允許主動輸出
     ip6tables -A OUTPUT -o lo -j ACCEPT
@@ -668,7 +662,7 @@ disable_in_docker(){
     sleep 1
     return 1
   fi
-  if ! iptables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  if ! iptables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
     iptables -A DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   fi
   if ! iptables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
@@ -679,7 +673,7 @@ disable_in_docker(){
     local ipv6=true
   fi
   if [[ "$ipv6" == "true" ]]; then
-    if ! ip6tables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    if ! ip6tables -C DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
       ip6tables -A DOCKER-USER -i $EXTERNAL_INTERFACE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     fi
     if ! ip6tables -C DOCKER-USER -i "$EXTERNAL_INTERFACE" -j DROP; then
@@ -834,8 +828,24 @@ install_fw() {
       fi
       ;;
     2)
-      yum update -y
-      yum install -y iptables-services
+      dnf update -y
+      dnf install -y kernel-modules kernel-modules-extra
+      local CURRENT_KERNEL=$(uname -r)
+      local LATEST_KERNEL=$(rpm -q --queryformat "%{VERSION}-%{RELEASE}.%{ARCH}\n" kernel-core | sort -V | tail -n 1)
+      if [ "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]; then
+        echo -e "${YELLOW}您好！
+        因為我們檢測裝置檢測到您內核發生變化，這會導致後面配置iptables防火牆發生嚴重錯誤，請您立刻重啟系統！${RESET}"
+        read -p "是否繼續？(一定要輸入Y/n)" confirm
+        confirm=${confirm,,}
+        confirm=${confirm:-n}
+        if [[ $confirm == y ]]; then
+          reboot
+        else
+          echo -e "${RED}終止運行${RESET}"
+          exit 1
+        fi
+      fi
+      dnf install -y iptables-services
       read -p "是否執行基礎防火牆配置？(Y/n): [預設為是]" confirm
       confirm=${confirm,,}  # 轉小寫
       confirm=${confirm:-y}
@@ -1060,8 +1070,7 @@ menu_allow_port() {
     elif [ $fw == iptables ]; then
       if [[ "$proto" == "all" ]]; then
         # TCP
-        iptables $TARGET_ADD $
-        $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j ACCEPT
+        iptables $TARGET_ADD $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j ACCEPT
         ip6tables $TARGET_ADD $TARGET_CHAIN -p tcp $IPT_ARGS "$port" -j ACCEPT
         # UDP
         iptables $TARGET_ADD $TARGET_CHAIN -p udp $IPT_ARGS "$port" -j ACCEPT
