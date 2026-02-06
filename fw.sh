@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.0.2"
+version="7.1.0"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -833,8 +833,7 @@ install_fw() {
       local CURRENT_KERNEL=$(uname -r)
       local LATEST_KERNEL=$(rpm -q --queryformat "%{VERSION}-%{RELEASE}.%{ARCH}\n" kernel-core | sort -V | tail -n 1)
       if [ "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]; then
-        echo -e "${YELLOW}您好！
-        因為我們檢測裝置檢測到您內核發生變化，這會導致後面配置iptables防火牆發生嚴重錯誤，請您立刻重啟系統！${RESET}"
+        echo -e "${YELLOW}您好！因為我們檢測裝置檢測到您內核發生變化，這會導致後面配置iptables防火牆發生嚴重錯誤，請您立刻重啟系統！${RESET}"
         read -p "是否繼續？(一定要輸入Y/n)" confirm
         confirm=${confirm,,}
         confirm=${confirm:-n}
@@ -1467,6 +1466,144 @@ change_default_policy() {
   fi
 }
 
+change_ssh_port() {
+  local confirm=""
+  if [ "$system" -eq 2 ] && ! command -v semanage &> /dev/null; then
+    dnf install -y policycoreutils-python-utils
+  fi
+    
+  local current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}')
+  echo -e "目前 SSH 端口: ${GREEN}$current_port${RESET}"
+  read -p "請輸入新的 SSH 端口 (1-65535)，或輸入 0 取消: " new_port
+
+  if [[ "$new_port" -eq 0 ]]; then
+    echo "操作已取消。"
+    return 0
+  fi
+
+  if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [[ "$new_port" -lt 1 || "$new_port" -gt 65535 ]]; then
+    echo -e "${RED}錯誤：端口號無效。${RESET}"
+    sleep 1.5
+    return 1
+  fi
+    
+  sed -i '/^#\?Port /d' /etc/ssh/sshd_config
+  echo "Port $new_port" >> /etc/ssh/sshd_config
+    
+  if [ "$system" -eq 2 ]; then
+    semanage port -a -t ssh_port_t -p tcp "$new_port" 2>/dev/null || semanage port -m -t ssh_port_t -p tcp "$new_port"
+  fi
+  del_port tcp $current_port 
+  allow_port tcp $new_port 
+  save_rules
+  service sshd restart
+  echo -e "${GREEN}SSH 端口已設定為 $new_port。${RESET}"
+  read -p "是否設定ssh密鑰和開啟密鑰登入？[Y/n](預設N)" confirm
+  confirm=${confirm,,}
+  confirm=${confirm:-n}
+  if [[ $confirm == y ]]; then
+    ssh_key
+  fi
+  return $?
+}
+
+ssh_key() {
+  if [ ! -d $HOME/.ssh ]; then
+    mkdir -p $HOME/.ssh
+    chmod 700 $HOME/.ssh
+    if [ "$system" -eq 2 ]; then
+      sudo restorecon -Rv $HOME/.ssh
+    fi
+  fi
+  local ssh_keys_path="$HOME/.ssh/authorized_keys"
+  if [ ! -e $ssh_keys_path ]; then
+    touch $ssh_keys_path
+    chmod 600 $ssh_keys_path
+  fi
+  while true; do
+    clear
+    echo "請選擇密鑰設定方式："
+    echo "1. 導入您自己的公鑰"
+    echo "2. 在伺服器上生成新的密鑰對 (私鑰將會顯示在螢幕上)"
+    echo "3. 返回"
+    read -p "請選擇 [1-3]: " key_choice
+    case $key_choice in
+    1)
+      read -p "請貼上您的公鑰內容:}" pub_key
+      if [[ -z "$pub_key" ]]; then
+        echo -e "${RED}未輸入公鑰，操作取消。${RESET}"
+        sleep 1.5
+        continue
+      fi
+      if grep -q -F "$pub_key" $ssh_keys_path; then
+        echo "此公鑰已存在。"
+      else
+        echo "$pub_key" >> $ssh_keys_path
+        echo -e "${GREEN}公鑰已成功導入。${RESET}"
+      fi
+      break
+      ;;
+    2)
+      ssh-keygen -t ed25519 -f /root/.ssh/temp_key -N ""
+      cat /root/.ssh/temp_key.pub >> $ssh_keys_path
+      echo -e "${YELLOW}請立刻複製以下私鑰並妥善保存！${RESET}"
+      echo -e "${YELLOW}這是您唯一一次看到它的機會，關閉此視窗後它將被刪除。${RESET}"
+      echo "----------------------------------------------------"
+      cat /root/.ssh/temp_key
+      echo "----------------------------------------------------"
+      read -p "我已複製並保存好私鑰，繼續。(請按 Enter)"
+      rm -rf $HOME/.ssh/temp_key $HOME/.ssh/temp_key.pub
+      break
+      ;;
+    3)
+      break
+      ;;
+    *)
+      echo -e "${RED}無效選擇。${RESET}"
+      sleep 1
+      ;;
+    esac
+  done
+  local is_key_only=$(grep -E "^PermitRootLogin (prohibit-password|without-password)" /etc/ssh/sshd_config)
+  local is_pwd_off=$(grep -E "^PasswordAuthentication no" /etc/ssh/sshd_config)
+  if [[ -n "$is_key_only" && -n "$is_pwd_off" ]]; then
+    service sshd restart
+    return 0
+  fi
+  
+  sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin without-password/' /etc/ssh/sshd_config
+  # 全局禁用密碼認證
+  sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  service sshd restart
+}
+
+menu_ssh(){
+  while true; do
+    echo "1. 更改ssh端口"
+    echo ""
+    echo "2. ssh變更成僅密鑰登入（或添加密鑰）"
+    echo -e "${BLUE}-----------------${RESET}"
+    echo -e "${YELLOW}0. 返回${RESET}"
+    read -p "請選擇：[0-2]" choice
+    case $choice in
+    1)
+      change_ssh_port
+      break
+      ;;
+    2)
+      ssh_key
+      break
+      ;;
+    0)
+      break
+      ;;
+    *) 
+      echo -e "${RED}無效選擇，請重試${RESET}"
+      sleep 0.5
+      ;;
+    esac
+  done
+}
 
 munu_fw() {
   if [[ $fw == ufw ]]; then
@@ -1497,11 +1634,11 @@ menu_ufw(){
     echo ""
     echo -e "${CYAN}8. 阻止Censys IP訪問   9. 刪除阻止Censys IP${RESET}"
     echo ""
-    echo -e "${CYAN}10. 更改防火牆預設規則${RESET}"
+    echo -e "${CYAN}10. 更改防火牆預設規則   11. 修改ssh端口並執行將root更換成密鑰登入${RESET}"
     echo -e "${BLUE}------------------------${RESET}"
     echo -e "${RED}0. 退出                  u. 更新腳本${RESET}"
     echo ""
-    echo -n -e "${YELLOW}請選擇操作 [0-10 / u]: ${RESET}"
+    echo -n -e "${YELLOW}請選擇操作 [0-11 / u]: ${RESET}"
     read -r choice
     case $choice in
     1) 
@@ -1542,6 +1679,9 @@ menu_ufw(){
       ;;
     10)
       change_default_policy
+      ;;
+    11)
+      menu_ssh
       ;;
     0)
       echo "感謝使用防火牆管理工具，再見！"
@@ -1585,10 +1725,12 @@ menu_iptables() {
     echo ""
     echo -e "${CYAN}12. 顯示ipv6防火牆規則    13. 更改防火牆預設規則${RESET}"
     echo ""
+    echo -e "${CYAN}14. 修改ssh端口並執行將root更換成密鑰登入${RESET}"
+    echo ""
     echo -e "${BLUE}------------------------${RESET}"
     echo -e "${RED}0. 退出              u. 更新腳本${RESET}"
     echo ""
-    echo -n -e "${YELLOW}請選擇操作 [0-13 / u]: ${RESET}"
+    echo -n -e "${YELLOW}請選擇操作 [0-14 / u]: ${RESET}"
     read -r choice
     case $choice in
     1)
@@ -1639,6 +1781,9 @@ menu_iptables() {
     13)
       clear
       change_default_policy
+      ;;
+    14)
+      menu_ssh
       ;;
     0)
       echo "感謝使用防火牆管理工具，再見！"
