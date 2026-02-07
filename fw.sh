@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.1.0"
+version="7.1.1"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -513,7 +513,7 @@ check_docker(){
 
 default_settings(){
   # 取得 SSH 設定中的 Port，若未設定則預設為 22
-  local ssh_port=$(grep -E '^Port ' /etc/ssh/sshd_config | awk '{print $2}')
+  local ssh_port=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}')
 
   # 如果未設定Port則預設為22
   if [[ -z "$ssh_port" ]]; then
@@ -533,7 +533,7 @@ default_settings(){
 :OUTPUT ACCEPT [0:0]
 
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
--A INPUT -p tcp --dport <port> -j ACCEPT
+-A INPUT -p tcp --dport $ssh_port -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A FORWARD -i lo -j ACCEPT
 
@@ -554,7 +554,7 @@ EOF
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT
 -A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
--A INPUT -p tcp --dport <port> -j ACCEPT
+-A INPUT -p tcp --dport $ssh_port -j ACCEPT
 -A INPUT -i lo -j ACCEPT
 -A FORWARD -i lo -j ACCEPT
 
@@ -564,21 +564,6 @@ EOF
     chmod 600 "$rules_v6"
     chmod 600 "$rules_v4"
     chmod 600 "$rules_v6"
-    # 替換 /etc/iptables/rules.v4 中的 <port> 為實際的 SSH port
-    if [[ -f "$rules_v4" ]]; then
-      sed -i "s/<port>/$ssh_port/g" "$rules_v4"
-      echo "Replaced <port> in $rules_v4 with $ssh_port"
-    else
-      echo "$rules_v4 does not exist."
-    fi
-
-    # 替換 /etc/iptables/rules.v6 中的 <port> 為實際的 SSH port
-    if [[ -f "$rules_v6" ]]; then
-      sed -i "s/<port>/$ssh_port/g" "$rules_v6"
-      echo "Replaced <port> in $rules_v6 with $ssh_port"
-    else
-      echo "$rules_v6 does not exist."
-    fi
     iptables-restore < /etc/iptables/rules.v4
     ip6tables-restore < /etc/iptables/rules.v6
     systemctl restart netfilter-persistent
@@ -1564,6 +1549,10 @@ ssh_key() {
       ;;
     esac
   done
+  ssh_change_key
+}
+
+ssh_change_key() {
   local is_key_only=$(grep -E "^PermitRootLogin (prohibit-password|without-password)" /etc/ssh/sshd_config)
   local is_pwd_off=$(grep -E "^PasswordAuthentication no" /etc/ssh/sshd_config)
   if [[ -n "$is_key_only" && -n "$is_pwd_off" ]]; then
@@ -1576,22 +1565,212 @@ ssh_key() {
   sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
   service sshd restart
 }
+del_ssh_key() {
+  local AUTH_KEYS="$HOME/.ssh/authorized_keys"
+
+  # 檢查檔案是否存在
+  if [ ! -f "$AUTH_KEYS" ]; then
+    echo -e "${RED}找不到 $AUTH_KEYS${RESET}"
+    sleep 1.5
+    return 1
+  fi
+
+  # 計算金鑰數量（忽略空行）
+  local key_count
+  key_count=$(grep -vc '^[[:space:]]*$' "$AUTH_KEYS")
+
+  if [ "$key_count" -le 1 ]; then
+    echo -e "${RED}目前只剩 $key_count 把 SSH 金鑰，為避免鎖死系統，已中止刪除。${RESET}"
+    sleep 1.5
+    return 1
+  fi
+
+  echo "目前 SSH 金鑰列表："
+  echo "----------------------------------------"
+
+  # 列出金鑰（顯示 index + 簡短內容）
+  nl -w2 -s') ' "$AUTH_KEYS" | sed 's/^[[:space:]]*//'
+
+  echo "----------------------------------------"
+  read -rp "請輸入要刪除的金鑰編號（1-$key_count）： " choice
+
+  # 檢查是否為數字
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}請輸入有效的數字${RESET}"
+    sleep 1.5
+    return 1
+  fi
+
+  # 檢查範圍
+  if [ "$choice" -lt 1 ] || [ "$choice" -gt "$key_count" ]; then
+    echo -e "${RED}編號超出範圍"
+    sleep 1.5
+    return 1
+  fi
+
+  # 再次確認
+  echo
+  echo -e "${YELLOW}即將刪除以下金鑰：${RESET}"
+  sed -n "${choice}p" "$AUTH_KEYS"
+  echo
+  read -rp "確認刪除？ [y/N]: " confirm
+
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    return 0
+  fi
+
+  # 刪除指定行
+  sed -i "${choice}d" "$AUTH_KEYS"
+
+  echo "${GREEN}SSH 金鑰已刪除${RESET}"
+}
+
+git_ssh_key() {
+  local AUTH_KEYS="$HOME/.ssh/authorized_keys"
+  mkdir -p "$HOME/.ssh"
+  touch "$AUTH_KEYS"
+  chmod 700 "$HOME/.ssh"
+  chmod 600 "$AUTH_KEYS"
+
+  echo -e "${RED}重要警告${RESET}"
+  echo "────────────────────────────"
+  echo "從 GitHub / GitLab 直接導入 SSH Key："
+  echo "如果你自己的私鑰洩漏的話=你所有綁定此公鑰的全部淪陷"
+  echo "生產環境『強烈不建議』使用"
+  echo "────────────────────────────"
+  read -rp "我已了解風險，仍要繼續？ [y/N]: " ok
+  [[ ! "$ok" =~ ^[Yy]$ ]] && echo "已取消" && return 0
+
+  echo
+  echo "選擇平台："
+  echo "1) GitHub"
+  echo "2) GitLab"
+  read -rp "請選擇 [1-2]: " platform
+
+  case "$platform" in
+    1) platform_name="github"; base_url="https://github.com" ;;
+    2) platform_name="gitlab"; base_url="https://gitlab.com" ;;
+    *) echo -e "${RED}無效選項${RESET}"; return 1 ;;
+  esac
+
+  read -rp "請輸入 ${platform_name} 使用者名稱: " username
+  [[ -z "$username" ]] && echo  -e "${RED}使用者名稱不可為空${RESET}" && sleep 1.5 && return 1
+
+  local url="${base_url}/${username}.keys"
+
+  local keys
+  if ! keys=$(curl -fsSL "$url"); then
+    echo -e "${RED}無法取得金鑰，請確認使用者名稱是否正確${RESET}"
+    sleep 1.5
+    return 1
+  fi
+
+  [[ -z "$keys" ]] && echo -e "${RED}該帳號沒有公開 SSH Key${RESET}" && sleep 1.5 && return 1
+
+  echo
+  echo "取得以下金鑰："
+  echo "────────────────────────────"
+  echo "$keys"
+  echo "────────────────────────────"
+
+  read -rp "是否導入到 authorized_keys？ [y/N]: " confirm
+  [[ ! "$confirm" =~ ^[Yy]$ ]] && echo "已取消" && return 0
+
+  if [ "$platform_name" = "github" ]; then
+    echo "$keys" >> "$AUTH_KEYS"
+  else
+    while read -r line; do
+      [[ -z "$line" ]] && continue
+      key_type=$(echo "$line" | awk '{print $1}')
+      key_body=$(echo "$line" | awk '{print $2}')
+      echo "${key_type} ${key_body}" >> "$AUTH_KEYS"
+    done <<< "$keys"
+  fi
+
+  echo -e "${GREEN}SSH 金鑰已成功導入${RESET}"
+  ssh_change_key
+}
+
+protect_ssh() {
+  if command -v ufw >/dev/null 2>&1; then
+    local ban="ufw"
+  else
+    ban="iptables-multiport"
+  fi
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    echo -e "${YELLOW}您已成功安裝，不需要再進行配置。${RESET}"
+    sleep 1.5
+    return 0
+  fi
+  if ! command -v fail2ban-client >/dev/null; then
+    case $system in
+    1)  apt install -y fail2ban ;;
+    2)  dnf install -y fail2ban-server fail2ban-selinux --setopt=install_weak_deps=False  ;;
+    3)  apk add fail2ban ;;
+    esac
+  fi
+  if [ ! -f "/etc/fail2ban/jail.local" ]; then
+    cp /etc/fail2ban/jail.conf "/etc/fail2ban/jail.local"
+  fi
+  if [ ! -f "/etc/fail2ban/jail.d/sshd.local" ]; then
+    local ssh_port=$(sshd -T 2>/dev/null | grep "^port " | awk '{print $2}')
+    if [ -z "$ssh_port" ]; then
+      ssh_port=22
+    fi
+    cat > '/etc/fail2ban/jail.d/sshd.local' <<EOF
+[sshd]
+enabled = true
+filter = sshd
+banaction = $ban
+port    = $ssh_port
+findtime = 10m
+maxretry = 3
+bantime = 24h
+
+EOF
+    if [[ $system -eq 1 || $system -eq 2 ]]; then
+      systemctl enable fail2ban --now
+      if [ $system -eq 2 ]; then
+        semanage permissive -a fail2ban_t
+      fi
+    else
+      rc-update add fail2ban default
+      service fail2ban start
+    fi
+    fail2ban-client reload
+    sleep 2
+    if fail2ban-client status sshd >/dev/null; then
+      echo -e "${GREEN}SSH 保護已經設定完成${RESET}"
+      sleep 1.5
+      return 0
+    else
+      echo -e "${RED}SSH 保護設定失敗，請檢查 fail2ban 日誌${RESET}"
+      return 1
+    fi
+  fi
+}
 
 menu_ssh(){
   while true; do
     echo "1. 更改ssh端口"
     echo ""
-    echo "2. ssh變更成僅密鑰登入（或添加密鑰）"
+    echo "2. ssh密鑰管理"
+    echo ""
+    echo "3. SSH保護"
     echo -e "${BLUE}-----------------${RESET}"
     echo -e "${YELLOW}0. 返回${RESET}"
-    read -p "請選擇：[0-2]" choice
+    read -p "請選擇：[0-3]" choice
     case $choice in
     1)
       change_ssh_port
       break
       ;;
     2)
-      ssh_key
+      manu_ssh_key
+      break
+      ;;
+    3)
+      protect_ssh
       break
       ;;
     0)
@@ -1600,6 +1779,133 @@ menu_ssh(){
     *) 
       echo -e "${RED}無效選擇，請重試${RESET}"
       sleep 0.5
+      ;;
+    esac
+  done
+}
+
+manu_ssh_key() {
+  # 定義計算顯示寬度的函數 (處理中文字寬)
+  _disp_len() {
+    local str="$1"
+    local width=0
+    local i=0
+    local len=${#str}
+    while [ $i -lt $len ]; do
+      local char="${str:$i:1}"
+      # 判斷是否為寬字符 (ASCII > 127)
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then 
+        width=$((width + 2))
+      else 
+        width=$((width + 1))
+      fi
+      i=$((i + 1))
+    done
+    echo $width
+  }
+
+  # 定義對齊函數 (左對齊)
+  _pad_right() {
+    local text="$1"
+    local max_width="$2"
+    local current_width=$(_disp_len "$text")
+    local padding=$((max_width - current_width))
+    # 若 padding < 0 則設為 0
+    ((padding < 0)) && padding=0
+    printf "%s%*s" "$text" $padding ""
+  }
+
+  while true; do
+    echo -e "${BLUE}---------------------${RESET}"
+    
+    # --- 開始：自定義顯示 authorized_keys ---
+    local auth_file="$HOME/.ssh/authorized_keys"
+    
+    if [[ -s "$auth_file" ]]; then
+      # 1. 讀取並解析數據
+      local -a rows_data
+      local count=0
+        
+      while read -r line; do
+        # 跳過空行或註釋
+        [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]] && continue
+        local k_type=$(echo "$line" | awk '{print $1}')
+        local k_val=$(echo "$line" | awk '{print $2}')
+        [[ -z "$k_val" ]] && continue
+            
+        local snippet="$k_val"
+        if [[ ${#k_val} -gt 8 ]]; then
+          snippet="${k_val:0:4}...${k_val: -4}"
+        fi
+        local clean_type="${k_type#ssh-}"
+        count=$((count + 1))
+        rows_data+=("$count|$snippet|$clean_type")
+        done < "$auth_file"
+
+        # 2. 計算各列最大寬度
+        local h1="編號"
+        local h2="密鑰（前四後四）"
+        local h3="密鑰格式"
+        
+        local w1=$(_disp_len "$h1")
+        local w2=$(_disp_len "$h2")
+        local w3=$(_disp_len "$h3")
+        
+        for row in "${rows_data[@]}"; do
+            IFS='|' read -r c1 c2 c3 <<< "$row"
+            local l1=$(_disp_len "$c1"); [[ $l1 -gt $w1 ]] && w1=$l1
+            local l2=$(_disp_len "$c2"); [[ $l2 -gt $w2 ]] && w2=$l2
+            local l3=$(_disp_len "$c3"); [[ $l3 -gt $w3 ]] && w3=$l3
+        done
+        
+        # 增加一點間距緩衝
+        w1=$((w1 + 2))
+        w2=$((w2 + 4))
+        # 最後一列不需要過多緩衝
+
+        # 3. 輸出表頭
+        _pad_right "$h1" "$w1"
+        _pad_right "$h2" "$w2"
+        echo "$h3" # 最後一欄直接印出即可
+        
+        # 4. 輸出內容
+        for row in "${rows_data[@]}"; do
+            IFS='|' read -r c1 c2 c3 <<< "$row"
+            _pad_right "$c1" "$w1"
+            _pad_right "$c2" "$w2"
+            echo "$c3"
+        done
+        
+        if [ ${#rows_data[@]} -eq 0 ]; then
+             echo -e "${YELLOW}  (檔案為空或格式無法識別)${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}  (無 SSH 密鑰紀錄)${RESET}"
+    fi
+    # --- 結束：自定義顯示 ---
+
+    echo -e "${BLUE}---------------------${RESET}"
+    echo -e "${CYAN}1. 添加密鑰並修改成密鑰登入     2. 刪除密鑰${RESET}"
+    echo ""
+    echo -e "${CYAN}3. 添加GitHub/Gitlab密鑰【生產環境盡量別用】{RESET}"
+    echo -e "${BLUE}---------------------${RESET}"
+    echo -e "${RED}0. 返回${RESET}"
+    echo -n -e "${YELLOW}請選擇操作 [0-3]: ${RESET}"
+    read -r choice 
+    case $choice in
+    1)
+      ssh_key
+      ;;
+    2)
+      del_ssh_key
+      ;;
+    3)
+      git_ssh_key
+      ;;
+    0)
+      break
+      ;;
+    *)  echo -e "${RED}無效選擇${RESET}" && sleep 1.5
       ;;
     esac
   done
@@ -1634,7 +1940,7 @@ menu_ufw(){
     echo ""
     echo -e "${CYAN}8. 阻止Censys IP訪問   9. 刪除阻止Censys IP${RESET}"
     echo ""
-    echo -e "${CYAN}10. 更改防火牆預設規則   11. 修改ssh端口並執行將root更換成密鑰登入${RESET}"
+    echo -e "${CYAN}10. 更改防火牆預設規則   11. SSH管理${RESET}"
     echo -e "${BLUE}------------------------${RESET}"
     echo -e "${RED}0. 退出                  u. 更新腳本${RESET}"
     echo ""
@@ -1725,7 +2031,7 @@ menu_iptables() {
     echo ""
     echo -e "${CYAN}12. 顯示ipv6防火牆規則    13. 更改防火牆預設規則${RESET}"
     echo ""
-    echo -e "${CYAN}14. 修改ssh端口並執行將root更換成密鑰登入${RESET}"
+    echo -e "${CYAN}14. SSH 管理${RESET}"
     echo ""
     echo -e "${BLUE}------------------------${RESET}"
     echo -e "${RED}0. 退出              u. 更新腳本${RESET}"
