@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.1.1"
+version="7.1.2"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -365,12 +365,21 @@ censys_block() {
 check_system(){
   if command -v apt >/dev/null 2>&1; then
     system=1
-  elif command -v yum >/dev/null 2>&1; then
+  elif command -v dnf >/dev/null 2>&1; then
+    if grep -q -Ei "release 7|release 8" /etc/redhat-release; then
+      echo -e "${RED}不支援 CentOS 7 或 CentOS 8，請升級至 9 系列 (Rocky/Alma/CentOS Stream)${RESET}"
+      exit 1
+    fi
+    if command -v getenforce >/dev/null 2>&1; then
+      if [ "$(getenforce)" == "Enforcing" ]; then
+        selinux_enforcing=true
+      fi
+    fi
     system=2
   elif command -v apk >/dev/null 2>&1; then
     system=3
-   else
-    echo "不支援的系統。" >&2
+  else
+    echo -e "${RED}不支援的系統。${RESET}"
     exit 1
   fi
 }
@@ -467,6 +476,14 @@ check_app() {
         apk add wget
         ;;
     esac
+  fi
+  if $selinux_enforcing; then
+    if ! command -v semanage >/dev/null 2>&1; then
+      dnf install -y policycoreutils-python-utils
+    fi
+    if ! command -v getfacl >/dev/null 2>&1; then
+      dnf install -y acl
+    fi
   fi
 }
 
@@ -1453,10 +1470,7 @@ change_default_policy() {
 
 change_ssh_port() {
   local confirm=""
-  if [ "$system" -eq 2 ] && ! command -v semanage &> /dev/null; then
-    dnf install -y policycoreutils-python-utils
-  fi
-    
+  
   local current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}')
   echo -e "目前 SSH 端口: ${GREEN}$current_port${RESET}"
   read -p "請輸入新的 SSH 端口 (1-65535)，或輸入 0 取消: " new_port
@@ -1475,7 +1489,7 @@ change_ssh_port() {
   sed -i '/^#\?Port /d' /etc/ssh/sshd_config
   echo "Port $new_port" >> /etc/ssh/sshd_config
     
-  if [ "$system" -eq 2 ]; then
+  if $selinux_enforcing; then
     semanage port -a -t ssh_port_t -p tcp "$new_port" 2>/dev/null || semanage port -m -t ssh_port_t -p tcp "$new_port"
   fi
   del_port tcp $current_port 
@@ -1730,7 +1744,7 @@ bantime = 24h
 EOF
     if [[ $system -eq 1 || $system -eq 2 ]]; then
       systemctl enable fail2ban --now
-      if [ $system -eq 2 ]; then
+      if $selinux_enforcing; then
         semanage permissive -a fail2ban_t
       fi
     else
