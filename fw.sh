@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.1.2"
+version="7.1.3"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -511,12 +511,12 @@ check_iptables(){
     fi
     ;;
   2)
-    if systemctl list-unit-files | grep iptables > /dev/null 2>&1; then
+    if [ -f /usr/lib/systemd/system/iptables.service ]; then
       fw=iptables
     fi
     ;;
   3)
-    if rc-service iptables status > /dev/null 2>&1; then
+    if [ -f /etc/init.d/iptables ]; then
       fw=iptables
     fi
     ;;
@@ -1925,14 +1925,6 @@ manu_ssh_key() {
   done
 }
 
-munu_fw() {
-  if [[ $fw == ufw ]]; then
-    menu_ufw
-  elif [[ $fw == iptables ]]; then
-    menu_iptables
-  fi
-}
-
 menu_ufw(){
   while true; do
     clear
@@ -2159,8 +2151,9 @@ esac
 check_system
 check_app
 check_fw
-[[ -z $# ]] && check_cli_fw
-case "$1" in
+if [ $# -ne 0 ]; then
+  check_cli_fw
+  case "$1" in
   open|deny|del)
     act_iptables=ACCEPT
     act_ufw=allow
@@ -2224,6 +2217,11 @@ case "$1" in
       allow_ping
       exit 0
       ;;
-esac
+  esac
+fi
 menu_install_fw
-munu_fw
+if [[ $fw == ufw ]]; then
+  menu_ufw
+elif [[ $fw == iptables ]]; then
+  menu_iptables
+fi
