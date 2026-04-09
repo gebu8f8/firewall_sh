@@ -10,7 +10,7 @@ RED="\033[1;31m"
 BOLD_CYAN="\033[1;36;1m"
 RESET="\033[0m"
 
-version="7.1.3"
+version="7.1.4"
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
@@ -154,36 +154,30 @@ block_ping() {
 }
 
 allow_cf_ip() (
-  if [ "$fw" = ufw ]; then
-    local temp_file_v4="/tmp/cloudflare_ips_v4.txt"
-    local temp_file_v6="/tmp/cloudflare_ips_v6.txt"
-
-    curl -s https://www.cloudflare.com/ips-v4 > "$temp_file_v4"
-    curl -s https://www.cloudflare.com/ips-v6 > "$temp_file_v6"
-
-    while read -r ip; do
-      if [[ -n "$ip" ]]; then
-        if ! ufw status | grep -q "ALLOW.*$ip"; then
-          ufw allow from "$ip"
-        fi
-      fi
-    done < "$temp_file_v4"
-
-    while read -r ip; do
-      if [[ -n "$ip" ]]; then
-        if ! ufw status | grep -q "ALLOW.*$ip"; then
-          ufw allow from "$ip"
-        fi
-      fi
-    done < "$temp_file_v6"
-
-    rm -f "$temp_file_v4" "$temp_file_v6"
-    echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則添加。${RESET}"
-    return
-  fi
-  # Cloudflare IP 列表的 URL
   local CF_IPV4_URL="https://www.cloudflare.com/ips-v4"
   local CF_IPV6_URL="https://www.cloudflare.com/ips-v6"
+  if [ "$fw" = "ufw" ]; then
+    echo "正在更新 UFW 規則..."
+
+    local all_ips=$(curl -s $CF_IPV4_URL $CF_IPV6_URL)
+
+    # 2. 一次性獲取目前 UFW 的所有允許規則，存入變數
+    # 這樣在迴圈中比對的是記憶體字串，而不是重複執行命令
+    local current_ufw_rules=$(ufw status)
+
+    for ip in $all_ips; do
+      # 3. 在記憶體中比對，檢查 IP 是否已經存在於規則中
+      if [[ -n "$ip" ]]; then
+        if ! echo "$current_ufw_rules" | grep -qF "$ip"; then
+          echo "添加新 IP: $ip"
+          ufw allow from "$ip" comment 'Cloudflare IP'
+        fi
+      fi
+    done
+    echo -e "${GREEN}已完成 Cloudflare 規則添加。${RESET}"
+    return
+  fi
+
 
   # 定義允許的 iptables 規則鏈
   local CHAIN_NAME="ALLOW_CF"
@@ -206,9 +200,8 @@ allow_cf_ip() (
 
   echo "下載並添加 Cloudflare 的 IPv6 地址..."
   while IFS= read -r ip6; do
-    if [[ "$ip10" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-      ip6tables -A $CHAIN_NAME -s "$ip6" -j ACCEPT
-      echo "已允許 IPv6 地址：$ip6"
+    if [[ -n "$ip6" && "$ip6" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
+      ip6tables -A "$CHAIN_NAME" -s "$ip6" -j ACCEPT
     fi
   done < <(curl -s "$CF_IPV6_URL")
 
@@ -222,67 +215,48 @@ allow_cf_ip() (
 )
 
 del_cf_ip(){
-  if [ "$fw" = ufw ]; then
-    local temp_file_v4="/tmp/cloudflare_ips_v4.txt"
-    local temp_file_v6="/tmp/cloudflare_ips_v6.txt"
+  # --- UFW 簡化版 ---
+  if [ "$fw" = "ufw" ]; then
+    echo "正在從 UFW 移除 Cloudflare 規則..."
+    # 一次獲取所有 IP 並將目前規則存入變數
+    local all_ips=$(curl -s https://www.cloudflare.com/ips-v4 https://www.cloudflare.com/ips-v6)
+    local current_rules=$(ufw status)
 
-    curl -s https://www.cloudflare.com/ips-v4 > "$temp_file_v4"
-    curl -s https://www.cloudflare.com/ips-v6 > "$temp_file_v6"
-
-    while read -r ip; do
+    for ip in $all_ips; do
       if [[ -n "$ip" ]]; then
-        if ufw status | grep -q "ALLOW.*$ip"; then
-          ufw delete allow from "$ip"
+        # 在記憶體中比對，存在才刪除
+        if echo "$current_rules" | grep -qF "$ip"; then
+          ufw delete allow from "$ip" > /dev/null
+          echo "已刪除: $ip"
         fi
       fi
-    done < "$temp_file_v4"
-
-    while read -r ip; do
-      if [[ -n "$ip" ]]; then
-        if ufw status | grep -q "ALLOW.*$ip"; then
-          ufw delete allow from "$ip"
-        fi
-      fi
-    done < "$temp_file_v6"
-
-    rm -f "$temp_file_v4" "$temp_file_v6"
-    echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則刪除。${RESET}"
+    done
+    echo -e "${GREEN}UFW 規則清理完成。${RESET}"
     return
   fi
 
-  # Cloudflare IP 列表的 URL
-  local CF_IPV4_URL="https://www.cloudflare.com/ips-v4"
-  local CF_IPV6_URL="https://www.cloudflare.com/ips-v6"
-
-  
-
-  # 定義允許的 iptables 規則鏈
+  # --- iptables / ip6tables 暴力簡化版 ---
   local CHAIN_NAME="ALLOW_CF"
+  echo "正在刪除 iptables 鏈: $CHAIN_NAME"
 
-  while IFS= read -r ip; do
-    if [[ "$ip9" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-      iptables -D $CHAIN_NAME -s "$ip" -j ACCEPT 2>/dev/null
-    fi
-  done < <(curl -s "$CF_IPV4_URL")
-
-  while IFS= read -r ip6; do
-    if [[ "$ip6" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
-      ip6tables -D $CHAIN_NAME -s "$ip6" -j ACCEPT 2>/dev/null
-    fi
-  done < <(curl -s "$CF_IPV6_URL")
-
-  # 刪除規則鏈
-  iptables -F $CHAIN_NAME 2>/dev/null
-  iptables -X $CHAIN_NAME 2>/dev/null
-  ip6tables -F $CHAIN_NAME 2>/dev/null
-  ip6tables -X $CHAIN_NAME 2>/dev/null
+  # 1. 先從 INPUT 鏈中刪除對該自定義鏈的引用（避免鏈被佔用無法刪除）
   iptables -D INPUT -j $CHAIN_NAME 2>/dev/null
   ip6tables -D INPUT -j $CHAIN_NAME 2>/dev/null
 
+  # 2. 清空自定義鏈中的所有規則 (-F)
+  iptables -F $CHAIN_NAME 2>/dev/null
+  ip6tables -F $CHAIN_NAME 2>/dev/null
+
+  # 3. 刪除該自定義鏈本身 (-X)
+  iptables -X $CHAIN_NAME 2>/dev/null
+  ip6tables -X $CHAIN_NAME 2>/dev/null
+
+  # 4. 儲存變更
   save_rules
 
-  echo -e "${GREEN}已完成 Cloudflare IPv4 / IPv6 規則刪除。${RESET}"
+  echo -e "${GREEN}iptables Cloudflare 規則鏈已徹底移除。${RESET}"
 }
+
 
 censys_block() {
   local action="$1"  # 用法：add 或 del
@@ -374,6 +348,8 @@ check_system(){
       if [ "$(getenforce)" == "Enforcing" ]; then
         selinux_enforcing=true
       fi
+      else
+        selinux_enforcing=false
     fi
     system=2
   elif command -v apk >/dev/null 2>&1; then
@@ -1472,6 +1448,7 @@ change_ssh_port() {
   local confirm=""
   
   local current_port=$(grep -E '^ *Port [0-9]+' /etc/ssh/sshd_config | awk '{print $2}')
+  current_port=${current_port:-22}
   echo -e "目前 SSH 端口: ${GREEN}$current_port${RESET}"
   read -p "請輸入新的 SSH 端口 (1-65535)，或輸入 0 取消: " new_port
 
@@ -1901,7 +1878,7 @@ manu_ssh_key() {
     echo -e "${BLUE}---------------------${RESET}"
     echo -e "${CYAN}1. 添加密鑰並修改成密鑰登入     2. 刪除密鑰${RESET}"
     echo ""
-    echo -e "${CYAN}3. 添加GitHub/Gitlab密鑰【生產環境盡量別用】{RESET}"
+    echo -e "${CYAN}3. 添加GitHub/Gitlab密鑰【生產環境盡量別用】${RESET}"
     echo -e "${BLUE}---------------------${RESET}"
     echo -e "${RED}0. 返回${RESET}"
     echo -n -e "${YELLOW}請選擇操作 [0-3]: ${RESET}"
